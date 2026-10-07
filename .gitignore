@@ -1,0 +1,16 @@
+# secrets — never commit real keys/tokens/endpoints
+.env
+.env.*
+*.local
+secrets.json
+config.local.*
+
+# os / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# node (if you add tooling later)
+node_modules/
+npm-debug.log*

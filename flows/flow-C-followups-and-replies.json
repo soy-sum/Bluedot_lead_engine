@@ -1,0 +1,147 @@
+{
+  "name": "Acme Service C — Draft Follow-ups (C-draft)",
+  "description": "Webhook-triggered. Pulls mailed contacts from the CRM, finds who is due a follow-up (touch count + not replied + gap elapsed), writes a personalised draft per contact to the Followup-Outbox sheet, then POSTs /handoff to unlock the C-send button.",
+  "tags": [],
+  "pieces": [
+    "@activepieces/piece-webhook",
+    "@activepieces/piece-google-sheets"
+  ],
+  "template": {
+    "displayName": "Acme Service C — Draft Follow-ups (C-draft)",
+    "trigger": {
+      "name": "trigger",
+      "valid": true,
+      "displayName": "C-draft webhook (control plane calls this)",
+      "type": "PIECE_TRIGGER",
+      "settings": {
+        "pieceName": "@activepieces/piece-webhook",
+        "pieceVersion": "~0.1.5",
+        "pieceType": "OFFICIAL",
+        "packageType": "REGISTRY",
+        "triggerName": "catch_webhook",
+        "input": {
+          "authType": "none",
+          "method": "POST"
+        },
+        "inputUiInfo": {},
+        "errorHandlingOptions": {}
+      },
+      "nextAction": {
+        "name": "c1_scan",
+        "type": "CODE",
+        "valid": true,
+        "displayName": "C1 · the CRM follow-up scan",
+        "settings": {
+          "input": {
+            "the CRMAccessToken": "{{connections['the CRM'].access_token}}",
+            "apiDomain": "https://www.the CRMapis.com",
+            "apiVersion": "v2",
+            "maxContacts": 2000,
+            "maxDrafts": 50,
+            "senderName": "the sender",
+            "catalogUrl": "",
+            "touchCountField": "Touch_Count",
+            "lastTouchField": "Last_Touch_At",
+            "replyStatusField": "Follow_Up_Status"
+          },
+          "sourceCode": {
+            "code": "/**\n * Activepieces Code piece — Service C, Stack C1: the CRM follow-up scanner.\n *\n * Runs inside the **C-draft** flow (Webhook trigger). Pulls the contacts Service A\n * has already mailed straight from **the CRM**, works out who is due a follow-up\n * (touch count < schedule length AND not replied AND enough days since the last\n * touch), and writes a personalised draft per contact. Those drafts become rows in\n * the **Followup-Outbox** sheet; nothing is sent here — a human approves first.\n *\n * Flow:  Webhook -> THIS -> Loop(outboxRows)->Sheets Insert Row (Followup-Outbox)\n *        -> HTTP POST /handoff  (the interlock that unlocks the C-send button).\n *\n * SOURCE OF TRUTH IS CRM. Service A writes the CRM identity-only, so the follow-up\n * state fields below must exist on the Contact for this to have anything to read.\n * Create them once (or map existing ones via the *Field inputs):\n *   - touchCountField   (default 'Touch_Count',   number)  how many touches so far\n *   - lastTouchField    (default 'Last_Touch_At',  datetime) when the last one went\n *   - replyStatusField  (default 'Follow_Up_Status', text) 'replied'/'opted_out' etc.\n * The C-send flow's c3 step writes touchCount + lastTouch back after each send, and\n * the reply handler should set replyStatus='replied' so follow-ups stop.\n *\n * INPUTS\n *   the CRMAccessToken  = {{connections['the CRM'].access_token}}   (required)\n *   apiDomain        = the CRM DC host (default https://www.the CRMapis.com; .in/.eu/…)\n *   apiVersion       = default 'v2'\n *   maxContacts      = safety cap on how many contacts to pull (default 2000)\n *   followupSchedule = days after FIRST touch each follow-up is due; default [4,7,14,30]\n *   maxDrafts        = cap drafts produced per run (default 50)\n *   senderName       = default 'the sender'\n *   catalogUrl       = optional\n *   touchCountField / lastTouchField / replyStatusField = the CRM field API names (see above)\n *\n * OUTPUT { outboxRows, drafts, stats }\n *   outboxRows feed the Followup-Outbox insert loop. Columns match the sheet:\n *   touchNo, contact, client, country, to, subject, body, approved, status,\n *   the CRMId, buyerKey, queuedAt.\n */\n\nexport const code = async (inputs) => {\n  const token = String(inputs.the CRMAccessToken || '').trim();\n  const apiDomain = String(inputs.apiDomain || 'https://www.the CRMapis.com').replace(/\\/+$/, '');\n  const apiVersion = String(inputs.apiVersion || 'v2').replace(/^\\/+|\\/+$/g, '');\n  const maxContacts = Number(inputs.maxContacts) > 0 ? Number(inputs.maxContacts) : 2000;\n  const maxDrafts = Number(inputs.maxDrafts) > 0 ? Number(inputs.maxDrafts) : 50;\n  const senderName = inputs.senderName || 'the sender';\n  const catalogUrl = inputs.catalogUrl || '';\n  const schedule = Array.isArray(inputs.followupSchedule) && inputs.followupSchedule.length\n    ? inputs.followupSchedule.map(Number)\n    : [4, 7, 14, 30];\n\n  const F_TOUCH = String(inputs.touchCountField || 'Touch_Count');\n  const F_LAST = String(inputs.lastTouchField || 'Last_Touch_At');\n  const F_REPLY = String(inputs.replyStatusField || 'Follow_Up_Status');\n\n  if (!token) {\n    return { outboxRows: [], drafts: [], stats: { error: 'no the CRMAccessToken' } };\n  }\n\n  const STOP_STATUSES = new Set(['replied', 'bounced', 'unsubscribed', 'closed', 'opted_out']);\n  const now = Date.now();\n  const daysSince = (iso) => {\n    const t = Date.parse(iso);\n    return isNaN(t) ? Infinity : (now - t) / 86400000;\n  };\n  const clean = (s) => (s === null || s === undefined ? '' : String(s)).replace(/\\s+/g, ' ').trim();\n  const firstName = (full) => clean(full).split(' ')[0] || '';\n\n  // ---- pull mailed contacts from the CRM (paged) --------------------------------\n  const base = `${apiDomain}/crm/${apiVersion}/Contacts`;\n  const fields = [\n    'Email', 'First_Name', 'Last_Name', 'Full_Name', 'Account_Name',\n    'Mailing_Country', 'Description', F_TOUCH, F_LAST, F_REPLY,\n  ].filter((v, i, a) => v && a.indexOf(v) === i);\n\n  const contacts = [];\n  let page = 1;\n  try {\n    while (contacts.length < maxContacts) {\n      const url = `${base}?fields=${encodeURIComponent(fields.join(','))}` +\n        `&per_page=200&page=${page}`;\n      const r = await fetch(url, {\n        headers: { Authorization: 'the CRM-oauthtoken ' + token },\n        signal: AbortSignal.timeout(30000),\n      });\n      if (r.status === 204) break; // no more records\n      if (!r.ok) {\n        return { outboxRows: [], drafts: [],\n          stats: { error: 'the CRM fetch ' + r.status, page } };\n      }\n      const j = await r.json().catch(() => ({}));\n      const batch = Array.isArray(j.data) ? j.data : [];\n      contacts.push(...batch);\n      const more = j.info && j.info.more_records;\n      if (!more || batch.length === 0) break;\n      page++;\n    }\n  } catch (e) {\n    return { outboxRows: [], drafts: [], stats: { error: String(e && e.message) } };\n  }\n\n  // ---- personalised, escalating nudges (zero-cost, templated by touch no.) ----\n  const followupBody = (name, country, n) => {\n    const hi = `Hi${name ? ' ' + name : ' team'},\\n\\n`;\n    const sig = `\\n\\n${senderName}, Acme Exports` +\n      (catalogUrl ? `\\nCatalogue: ${catalogUrl}` : '');\n    const us = /^(usa|us|united states|u\\.s\\.a?\\.?)$/i.test(clean(country));\n    const msg = {\n      1: `Just floating this back to the top of your inbox — happy to send a few ` +\n         `bagasse tableware samples and a landed-cost quote for the SKUs you move most. ` +\n         `Worth a quick look?`,\n      2: `Following up with something concrete: share the 3–4 SKUs you import most ` +\n         `and I'll send Ex-factory + FOB pricing and free samples. No commitment — ` +\n         `just a like-for-like cost comparison against your current supplier.`,\n      3: (us\n          ? `With the current tariff picture on Chinese goods, a certified India source ` +\n            `is worth pricing out. `\n          : ``) +\n         `Switching is easier than it sounds — we match product weight and OGR so your ` +\n         `spec doesn't change, and handle shipping end to end. Open to a 10-min call?`,\n      4: `Last note from me on this — if a certified India supplier for your bagasse ` +\n         `tableware is worth exploring this quarter, I'll share pricing and samples. ` +\n         `If the timing's off, no worries and I'll close this out — just reply either way.`,\n    };\n    return hi + (msg[n] || msg[4]) + sig;\n  };\n\n  const outboxRows = [];\n  const drafts = [];\n  const nowIso = new Date().toISOString();\n  const stats = { pulled: contacts.length, due: 0, maxedOut: 0, notYet: 0,\n    replied: 0, noEmail: 0 };\n\n  for (const c of contacts) {\n    const email = clean(c.Email);\n    if (!email.includes('@')) { stats.noEmail++; continue; }\n\n    const replyStatus = clean(c[F_REPLY]).toLowerCase();\n    if (STOP_STATUSES.has(replyStatus)) { stats.replied++; continue; }\n\n    const count = Number(c[F_TOUCH] || 0);\n    if (count >= schedule.length) { stats.maxedOut++; continue; }\n\n    // due when enough days have passed since the last touch for this step.\n    // Base the clock off Last_Touch_At; if missing (never followed up yet),\n    // this contact is treated as due immediately for its next nudge.\n    const dueGap = schedule[count];\n    const sinceLast = c[F_LAST] ? daysSince(c[F_LAST]) : Infinity;\n    if (sinceLast < dueGap) { stats.notYet++; continue; }\n\n    const name = clean(c.Full_Name) || clean(`${c.First_Name || ''} ${c.Last_Name || ''}`);\n    const client = clean(c.Account_Name && (c.Account_Name.name || c.Account_Name)) || name;\n    const country = clean(c.Mailing_Country);\n    const touchNo = count + 1;\n    const subject = 'Re: ' + 'Bagasse tableware from India';\n    const body = followupBody(firstName(name), country, touchNo);\n\n    const row = {\n      touchNo,\n      contact: name,\n      client,\n      country,\n      to: email,\n      subject,\n      body,\n      approved: '',           // human sets 'yes'\n      status: 'pending',\n      the CRMId: clean(c.id),\n      buyerKey: (client || email).toLowerCase(),\n      queuedAt: nowIso,\n    };\n    outboxRows.push(row);\n    drafts.push(row);\n    stats.due++;\n    if (outboxRows.length >= maxDrafts) { stats.heldByCap = true; break; }\n  }\n\n  return { outboxRows, drafts, stats };\n};\n",
+            "packageJson": "{\n  \"dependencies\": {}\n}"
+          },
+          "inputUiInfo": {
+            "customizedInputs": {}
+          },
+          "errorHandlingOptions": {
+            "continueOnFailure": {
+              "value": false
+            },
+            "retryOnFailure": {
+              "value": false
+            }
+          }
+        },
+        "nextAction": {
+          "name": "loop_outbox",
+          "type": "LOOP_ON_ITEMS",
+          "valid": true,
+          "displayName": "Loop: stage drafts",
+          "settings": {
+            "items": "{{c1_scan['outboxRows']}}",
+            "inputUiInfo": {}
+          },
+          "firstLoopAction": {
+            "name": "insert_outbox",
+            "type": "PIECE",
+            "valid": false,
+            "displayName": "Add row: Followup-Outbox",
+            "settings": {
+              "pieceName": "@activepieces/piece-google-sheets",
+              "pieceVersion": "~0.9.0",
+              "pieceType": "OFFICIAL",
+              "packageType": "REGISTRY",
+              "actionName": "insert_row",
+              "input": {
+                "values": {
+                  "touchNo": "{{loop_outbox['item']['touchNo']}}",
+                  "contact": "{{loop_outbox['item']['contact']}}",
+                  "client": "{{loop_outbox['item']['client']}}",
+                  "country": "{{loop_outbox['item']['country']}}",
+                  "to": "{{loop_outbox['item']['to']}}",
+                  "subject": "{{loop_outbox['item']['subject']}}",
+                  "body": "{{loop_outbox['item']['body']}}",
+                  "approved": "{{loop_outbox['item']['approved']}}",
+                  "status": "{{loop_outbox['item']['status']}}",
+                  "the CRMId": "{{loop_outbox['item']['the CRMId']}}",
+                  "buyerKey": "{{loop_outbox['item']['buyerKey']}}",
+                  "queuedAt": "{{loop_outbox['item']['queuedAt']}}"
+                }
+              },
+              "inputUiInfo": {},
+              "errorHandlingOptions": {
+                "continueOnFailure": {
+                  "value": false
+                },
+                "retryOnFailure": {
+                  "value": false
+                }
+              }
+            }
+          },
+          "nextAction": {
+            "name": "handoff",
+            "type": "CODE",
+            "valid": true,
+            "displayName": "C5 · POST /handoff (unlock C-send)",
+            "settings": {
+              "input": {
+                "crmBaseUrl": "https://your-crm.example.com",
+                "crmToken": "",
+                "button": "C-send",
+                "count": "{{c1_scan['outboxRows'].length}}"
+              },
+              "sourceCode": {
+                "code": "/**\n * Service C — POST /handoff (step C5). The interlock: tells the control plane the\n * follow-up drafts are staged in the sheet, which is what flips the C-send button\n * from disabled to enabled. Leaving this out is why a send button stays greyed.\n *\n * INPUTS\n *   crmBaseUrl = default https://your-crm.example.com\n *   crmToken   = CRM_API_TOKEN (bearer). Blank -> handoff is skipped (button stays locked).\n *   button     = which send button to unlock (default 'C-send')\n *   count      = how many drafts were staged (for the control plane to display)\n *   batch      = optional batch id\n */\nexport const code = async (inputs) => {\n  const base = String(inputs.crmBaseUrl || 'https://your-crm.example.com').replace(/\\/+$/, '');\n  const token = String(inputs.crmToken || '').trim();\n  const button = String(inputs.button || 'C-send');\n  const count = Number(inputs.count || 0);\n  const batch = String(inputs.batch || ('C-' + new Date().toISOString().slice(0, 19)));\n  if (!token) return { skipped: 'no crmToken — button stays locked', button };\n  try {\n    const r = await fetch(base + '/handoff', {\n      method: 'POST',\n      headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },\n      body: JSON.stringify({ service: 'C', button, staged: count, batch, ready: true }),\n      signal: AbortSignal.timeout(30000),\n    });\n    const body = await r.json().catch(() => ({}));\n    return { status: r.status, button, ...body };\n  } catch (e) {\n    return { error: String(e && e.message), button };\n  }\n};\n",
+                "packageJson": "{\n  \"dependencies\": {}\n}"
+              },
+              "inputUiInfo": {
+                "customizedInputs": {}
+              },
+              "errorHandlingOptions": {
+                "continueOnFailure": {
+                  "value": false
+                },
+                "retryOnFailure": {
+                  "value": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "valid": false,
+    "connectionIds": [],
+    "schemaVersion": "1"
+  },
+  "blogUrl": ""
+}

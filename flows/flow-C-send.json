@@ -1,0 +1,242 @@
+{
+  "name": "Acme Service C — Send Follow-ups (C-send)",
+  "description": "Webhook-triggered. Reads Followup-Outbox, sends only rows marked approved (throttle + test-mode), logs each to the separate Followup-Sent sheet, writes the new touch count back to the CRM, then deletes the sent rows from the Outbox.",
+  "tags": [],
+  "pieces": [
+    "@activepieces/piece-webhook",
+    "@activepieces/piece-google-sheets",
+    "@activepieces/piece-gmail"
+  ],
+  "template": {
+    "displayName": "Acme Service C — Send Follow-ups (C-send)",
+    "trigger": {
+      "name": "trigger",
+      "valid": true,
+      "displayName": "C-send webhook (control plane calls this on button click)",
+      "type": "PIECE_TRIGGER",
+      "settings": {
+        "pieceName": "@activepieces/piece-webhook",
+        "pieceVersion": "~0.1.5",
+        "pieceType": "OFFICIAL",
+        "packageType": "REGISTRY",
+        "triggerName": "catch_webhook",
+        "input": {
+          "authType": "none",
+          "method": "POST"
+        },
+        "inputUiInfo": {},
+        "errorHandlingOptions": {}
+      },
+      "nextAction": {
+        "name": "get_outbox",
+        "type": "PIECE",
+        "valid": false,
+        "displayName": "Get rows: Followup-Outbox",
+        "settings": {
+          "pieceName": "@activepieces/piece-google-sheets",
+          "pieceVersion": "~0.9.0",
+          "pieceType": "OFFICIAL",
+          "packageType": "REGISTRY",
+          "actionName": "get_rows",
+          "input": {},
+          "inputUiInfo": {},
+          "errorHandlingOptions": {
+            "continueOnFailure": {
+              "value": false
+            },
+            "retryOnFailure": {
+              "value": false
+            }
+          }
+        },
+        "nextAction": {
+          "name": "c2_gate",
+          "type": "CODE",
+          "valid": true,
+          "displayName": "C2 · Approved-send gate",
+          "settings": {
+            "input": {
+              "outbox": "{{get_outbox}}",
+              "maxPerRun": 20,
+              "dailyCap": 60,
+              "testMode": true,
+              "testRecipient": ""
+            },
+            "sourceCode": {
+              "code": "/**\n * Activepieces Code piece — Service C, Stack C2: Approved follow-up send gate.\n *\n * Runs inside the **C-send** flow (Webhook trigger). Reads the Followup-Outbox tab\n * and releases ONLY the rows a human marked `approved` and that haven't been sent.\n * Applies a throttle + test-mode redirect (same idea as Service A's stack 06), then\n * hands back: the batch to send, the rows to append to the separate Followup-Sent\n * sheet, the the CRM touch-updates, and the Outbox rows to DELETE (clean-up) — sorted\n * bottom-up so deleting one row never shifts the row number of another pending one.\n *\n * Flow:  Webhook -> Sheets Get Rows (Followup-Outbox) -> THIS\n *        -> Loop(toSend)->Gmail Send\n *        -> Loop(sentRows)->Sheets Insert Row (Followup-Sent)\n *        -> Code c3-the CRM-touch-update (touchUpdates)\n *        -> Loop(outboxDeletes)->Sheets Delete Row (Followup-Outbox).\n *\n * INPUTS\n *   outbox        = rows from the Followup-Outbox tab (must include each row's line no.)\n *   maxPerRun     = default 20\n *   dailyCap      = default 60\n *   testMode      = boolean\n *   testRecipient = your inbox (required if testMode)\n *\n * OUTPUT { toSend, sentRows, touchUpdates, outboxDeletes, skipped }\n */\n\nexport const code = async (inputs) => {\n  const normSheet = (v) => {\n    let rows = Array.isArray(v) ? v\n      : (v && (Array.isArray(v.rows) ? v.rows\n        : Array.isArray(v.values) ? v.values\n        : Array.isArray(v.body) ? v.body : [])) || [];\n    if (!Array.isArray(rows)) rows = [];\n    rows = rows.map((r) => (r && typeof r.values === 'object' && r.values) ? { row: r.row, ...r.values } : r);\n    const lettered = rows.some((r) => r && (r.A !== undefined || r.B !== undefined));\n    if (!lettered) return rows;\n    const header = rows.find((r) => String(r.row) === '1') || rows[0];\n    if (!header) return [];\n    const map = {};\n    for (const [k, val] of Object.entries(header)) if (k !== 'row') map[k] = String(val).trim();\n    const out = [];\n    for (const r of rows) {\n      if (r === header || String(r.row) === '1') continue;\n      const obj = {};\n      if (r.row !== undefined) obj.row = r.row;\n      for (const [k, val] of Object.entries(r)) {\n        if (k === 'row') continue;\n        const name = map[k];\n        if (name) obj[name] = val;\n      }\n      out.push(obj);\n    }\n    return out;\n  };\n\n  const outbox = normSheet(inputs.outbox);\n  const maxPerRun = Number(inputs.maxPerRun) > 0 ? Number(inputs.maxPerRun) : 20;\n  const dailyCap = Number(inputs.dailyCap) > 0 ? Number(inputs.dailyCap) : 60;\n  const testMode = Boolean(inputs.testMode);\n  const testRecipient = String(inputs.testRecipient || '').trim();\n\n  const isApproved = (v) => /^(y|yes|true|1|approve|approved|✓|x)$/i.test(String(v || '').trim());\n  const isSent = (v) => /^(sent|done)$/i.test(String(v || '').trim());\n\n  if (testMode && !testRecipient) {\n    return { toSend: [], sentRows: [], touchUpdates: [], outboxDeletes: [],\n      skipped: { error: 'testMode on but no testRecipient' } };\n  }\n\n  const skipped = { notApproved: 0, alreadySent: 0, noRow: 0, noEmail: 0 };\n  const eligible = [];\n  for (const r of outbox) {\n    if (!isApproved(r.approved)) { skipped.notApproved++; continue; }\n    if (isSent(r.status)) { skipped.alreadySent++; continue; }\n    if (r.row === undefined || r.row === null || r.row === '') { skipped.noRow++; continue; }\n    if (!String(r.to || '').includes('@')) { skipped.noEmail++; continue; }\n    eligible.push(r);\n  }\n\n  const takeN = Math.min(maxPerRun, dailyCap, eligible.length);\n  const batch = eligible.slice(0, takeN);\n\n  const nowIso = new Date().toISOString();\n  const toSend = [];\n  const sentRows = [];\n  const touchUpdates = [];\n  const outboxDeletes = [];\n\n  for (const r of batch) {\n    const realTo = r.to;\n    toSend.push({\n      to: testMode ? testRecipient : realTo,\n      subject: testMode ? `[TEST → ${realTo}] ${r.subject}` : r.subject,\n      body: r.body,\n    });\n    sentRows.push({\n      touchNo: r.touchNo || '', contact: r.contact || '', client: r.client || '',\n      country: r.country || '', to: realTo, subject: r.subject || '',\n      status: 'sent', sentAt: nowIso, the CRMId: r.the CRMId || '',\n      buyerKey: r.buyerKey || '', testMode: testMode ? 'yes' : 'no',\n    });\n    // c3 turns these into a the CRM update: bump Touch_Count, stamp Last_Touch_At.\n    touchUpdates.push({\n      the CRMId: r.the CRMId || '', to: realTo,\n      touchNo: Number(r.touchNo || 0), lastTouchAt: nowIso,\n      testMode: testMode ? 'yes' : 'no',\n    });\n    outboxDeletes.push({ row: Number(r.row) });\n  }\n\n  // delete bottom-up so removing one row doesn't renumber the rows still pending.\n  outboxDeletes.sort((a, b) => b.row - a.row);\n\n  return {\n    toSend, sentRows, touchUpdates, outboxDeletes,\n    skipped: { ...skipped, eligible: eligible.length, sending: batch.length,\n      heldByThrottle: Math.max(0, eligible.length - batch.length) },\n  };\n};\n",
+              "packageJson": "{\n  \"dependencies\": {}\n}"
+            },
+            "inputUiInfo": {
+              "customizedInputs": {}
+            },
+            "errorHandlingOptions": {
+              "continueOnFailure": {
+                "value": false
+              },
+              "retryOnFailure": {
+                "value": false
+              }
+            }
+          },
+          "nextAction": {
+            "name": "loop_send",
+            "type": "LOOP_ON_ITEMS",
+            "valid": true,
+            "displayName": "Loop: send approved follow-ups",
+            "settings": {
+              "items": "{{c2_gate['toSend']}}",
+              "inputUiInfo": {}
+            },
+            "firstLoopAction": {
+              "name": "send_gmail",
+              "type": "PIECE",
+              "valid": false,
+              "displayName": "Send follow-up (from sender@)",
+              "settings": {
+                "pieceName": "@activepieces/piece-gmail",
+                "pieceVersion": "~0.8.0",
+                "pieceType": "OFFICIAL",
+                "packageType": "REGISTRY",
+                "actionName": "send_email",
+                "input": {
+                  "receiver": [
+                    "{{loop_send['item']['to']}}"
+                  ],
+                  "subject": "{{loop_send['item']['subject']}}",
+                  "body_text": "{{loop_send['item']['body']}}"
+                },
+                "inputUiInfo": {},
+                "errorHandlingOptions": {
+                  "continueOnFailure": {
+                    "value": false
+                  },
+                  "retryOnFailure": {
+                    "value": false
+                  }
+                }
+              }
+            },
+            "nextAction": {
+              "name": "loop_log",
+              "type": "LOOP_ON_ITEMS",
+              "valid": true,
+              "displayName": "Loop: log to Followup-Sent",
+              "settings": {
+                "items": "{{c2_gate['sentRows']}}",
+                "inputUiInfo": {}
+              },
+              "firstLoopAction": {
+                "name": "insert_sent",
+                "type": "PIECE",
+                "valid": false,
+                "displayName": "Log to Followup-Sent",
+                "settings": {
+                  "pieceName": "@activepieces/piece-google-sheets",
+                  "pieceVersion": "~0.9.0",
+                  "pieceType": "OFFICIAL",
+                  "packageType": "REGISTRY",
+                  "actionName": "insert_row",
+                  "input": {
+                    "values": {
+                      "touchNo": "{{loop_log['item']['touchNo']}}",
+                      "contact": "{{loop_log['item']['contact']}}",
+                      "client": "{{loop_log['item']['client']}}",
+                      "country": "{{loop_log['item']['country']}}",
+                      "to": "{{loop_log['item']['to']}}",
+                      "subject": "{{loop_log['item']['subject']}}",
+                      "status": "{{loop_log['item']['status']}}",
+                      "sentAt": "{{loop_log['item']['sentAt']}}",
+                      "the CRMId": "{{loop_log['item']['the CRMId']}}",
+                      "buyerKey": "{{loop_log['item']['buyerKey']}}",
+                      "testMode": "{{loop_log['item']['testMode']}}"
+                    }
+                  },
+                  "inputUiInfo": {},
+                  "errorHandlingOptions": {
+                    "continueOnFailure": {
+                      "value": false
+                    },
+                    "retryOnFailure": {
+                      "value": false
+                    }
+                  }
+                }
+              },
+              "nextAction": {
+                "name": "c3_update",
+                "type": "CODE",
+                "valid": true,
+                "displayName": "C3 · the CRM touch write-back",
+                "settings": {
+                  "input": {
+                    "updates": "{{c2_gate['touchUpdates']}}",
+                    "the CRMAccessToken": "{{connections['the CRM'].access_token}}",
+                    "apiDomain": "https://www.the CRMapis.com",
+                    "apiVersion": "v2",
+                    "touchCountField": "Touch_Count",
+                    "lastTouchField": "Last_Touch_At",
+                    "writeInTestMode": false
+                  },
+                  "sourceCode": {
+                    "code": "/**\n * Activepieces Code piece — Service C, Stack C3: the CRM touch write-back.\n *\n * Runs inside the **C-send** flow, right after the follow-ups are sent. For each\n * contact just nudged it updates the the CRM Contact record so the next C-draft run\n * sees the new state: bumps the touch count and stamps the last-touch time. This is\n * what closes the loop — the CRM is Service C's source of truth, so without this the\n * same contacts would be re-drafted next run.\n *\n * In testMode nothing is written to the CRM (so a dry run leaves the CRM untouched),\n * unless writeInTestMode=true.\n *\n * Flow:  … Gmail Send -> Insert Followup-Sent -> THIS -> Loop(outboxDeletes)->Delete.\n *\n * INPUTS\n *   updates         = c2.touchUpdates  [{ the CRMId, to, touchNo, lastTouchAt, testMode }]\n *   the CRMAccessToken = {{connections['the CRM'].access_token}}   (required)\n *   apiDomain       = the CRM DC host (default https://www.the CRMapis.com)\n *   apiVersion      = default 'v2'\n *   touchCountField = default 'Touch_Count'\n *   lastTouchField  = default 'Last_Touch_At'\n *   writeInTestMode = default false (skip the CRM writes while testing)\n *\n * OUTPUT { updated, skipped, errors }\n */\n\nexport const code = async (inputs) => {\n  const updates = Array.isArray(inputs.updates) ? inputs.updates : [];\n  const token = String(inputs.the CRMAccessToken || '').trim();\n  const apiDomain = String(inputs.apiDomain || 'https://www.the CRMapis.com').replace(/\\/+$/, '');\n  const apiVersion = String(inputs.apiVersion || 'v2').replace(/^\\/+|\\/+$/g, '');\n  const F_TOUCH = String(inputs.touchCountField || 'Touch_Count');\n  const F_LAST = String(inputs.lastTouchField || 'Last_Touch_At');\n  const writeInTestMode = Boolean(inputs.writeInTestMode);\n\n  if (!token) return { updated: 0, skipped: updates.length, errors: ['no the CRMAccessToken'] };\n\n  const sleep = (ms) => new Promise((res) => setTimeout(res, ms));\n  const base = `${apiDomain}/crm/${apiVersion}/Contacts`;\n\n  let updated = 0;\n  let skipped = 0;\n  const errors = [];\n\n  for (const u of updates) {\n    if (!writeInTestMode && String(u.testMode) === 'yes') { skipped++; continue; }\n    const id = String(u.the CRMId || '').trim();\n    if (!id) { skipped++; continue; } // no the CRM id — can't target the record\n\n    const record = {};\n    record[F_TOUCH] = Number(u.touchNo || 0);\n    record[F_LAST] = u.lastTouchAt || new Date().toISOString();\n\n    try {\n      const r = await fetch(`${base}/${encodeURIComponent(id)}`, {\n        method: 'PUT',\n        headers: {\n          Authorization: 'the CRM-oauthtoken ' + token,\n          'Content-Type': 'application/json',\n        },\n        body: JSON.stringify({ data: [record] }),\n        signal: AbortSignal.timeout(20000),\n      });\n      const body = await r.json().catch(() => ({}));\n      const ok = r.ok && body && Array.isArray(body.data) &&\n        body.data[0] && body.data[0].code === 'SUCCESS';\n      if (ok) updated++;\n      else errors.push({ id, status: r.status, detail: body && body.data && body.data[0] });\n    } catch (e) {\n      errors.push({ id, error: String(e && e.message) });\n    }\n    await sleep(120); // stay under the CRM's per-second write budget\n  }\n\n  return { updated, skipped, errors };\n};\n",
+                    "packageJson": "{\n  \"dependencies\": {}\n}"
+                  },
+                  "inputUiInfo": {
+                    "customizedInputs": {}
+                  },
+                  "errorHandlingOptions": {
+                    "continueOnFailure": {
+                      "value": false
+                    },
+                    "retryOnFailure": {
+                      "value": false
+                    }
+                  }
+                },
+                "nextAction": {
+                  "name": "loop_delete",
+                  "type": "LOOP_ON_ITEMS",
+                  "valid": true,
+                  "displayName": "Loop: clean Outbox (bottom-up)",
+                  "settings": {
+                    "items": "{{c2_gate['outboxDeletes']}}",
+                    "inputUiInfo": {}
+                  },
+                  "firstLoopAction": {
+                    "name": "delete_outbox",
+                    "type": "PIECE",
+                    "valid": false,
+                    "displayName": "Clean Outbox: delete sent row",
+                    "settings": {
+                      "pieceName": "@activepieces/piece-google-sheets",
+                      "pieceVersion": "~0.9.0",
+                      "pieceType": "OFFICIAL",
+                      "packageType": "REGISTRY",
+                      "actionName": "delete_row",
+                      "input": {
+                        "row_id": "{{loop_delete['item']['row']}}"
+                      },
+                      "inputUiInfo": {},
+                      "errorHandlingOptions": {
+                        "continueOnFailure": {
+                          "value": false
+                        },
+                        "retryOnFailure": {
+                          "value": false
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "valid": false,
+    "connectionIds": [],
+    "schemaVersion": "1"
+  },
+  "blogUrl": ""
+}

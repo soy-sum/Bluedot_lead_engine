@@ -1,0 +1,600 @@
+{
+  "name": "Acme Service A — Full (discover → approve → send)",
+  "description": "One daily flow. Sends the Outbox rows you edited + marked approved (logs them to Sent, marks them sent), then discovers new prospects, dedups vs the CRM + logs, personalizes US/ROW, and queues fresh drafts to Outbox for your approval. Approval happens in the Outbox sheet between runs.",
+  "tags": [],
+  "pieces": [
+    "@activepieces/piece-schedule",
+    "@activepieces/piece-google-sheets",
+    "@activepieces/piece-gmail"
+  ],
+  "template": {
+    "displayName": "Acme Service A — Full (discover → approve → send)",
+    "trigger": {
+      "name": "trigger",
+      "valid": true,
+      "displayName": "Service A · daily 06:00 UTC",
+      "type": "PIECE_TRIGGER",
+      "settings": {
+        "pieceName": "@activepieces/piece-schedule",
+        "pieceVersion": "~0.1.4",
+        "pieceType": "OFFICIAL",
+        "packageType": "REGISTRY",
+        "triggerName": "cron_expression",
+        "input": {
+          "expression": "0 9 * * *",
+          "timezone": "UTC"
+        },
+        "inputUiInfo": {},
+        "errorHandlingOptions": {}
+      },
+      "nextAction": {
+        "name": "get_leads",
+        "type": "PIECE",
+        "valid": false,
+        "displayName": "Get rows: Leads",
+        "settings": {
+          "pieceName": "@activepieces/piece-google-sheets",
+          "pieceVersion": "~0.9.0",
+          "pieceType": "OFFICIAL",
+          "packageType": "REGISTRY",
+          "actionName": "get_rows",
+          "input": {},
+          "inputUiInfo": {},
+          "errorHandlingOptions": {
+            "continueOnFailure": {
+              "value": false
+            },
+            "retryOnFailure": {
+              "value": false
+            }
+          }
+        },
+        "nextAction": {
+          "name": "get_found",
+          "type": "PIECE",
+          "valid": false,
+          "displayName": "Get rows: Found log",
+          "settings": {
+            "pieceName": "@activepieces/piece-google-sheets",
+            "pieceVersion": "~0.9.0",
+            "pieceType": "OFFICIAL",
+            "packageType": "REGISTRY",
+            "actionName": "get_rows",
+            "input": {},
+            "inputUiInfo": {},
+            "errorHandlingOptions": {
+              "continueOnFailure": {
+                "value": false
+              },
+              "retryOnFailure": {
+                "value": false
+              }
+            }
+          },
+          "nextAction": {
+            "name": "get_sent",
+            "type": "PIECE",
+            "valid": false,
+            "displayName": "Get rows: Sent",
+            "settings": {
+              "pieceName": "@activepieces/piece-google-sheets",
+              "pieceVersion": "~0.9.0",
+              "pieceType": "OFFICIAL",
+              "packageType": "REGISTRY",
+              "actionName": "get_rows",
+              "input": {},
+              "inputUiInfo": {},
+              "errorHandlingOptions": {
+                "continueOnFailure": {
+                  "value": false
+                },
+                "retryOnFailure": {
+                  "value": false
+                }
+              }
+            },
+            "nextAction": {
+              "name": "get_outbox",
+              "type": "PIECE",
+              "valid": false,
+              "displayName": "Get rows: Outbox",
+              "settings": {
+                "pieceName": "@activepieces/piece-google-sheets",
+                "pieceVersion": "~0.9.0",
+                "pieceType": "OFFICIAL",
+                "packageType": "REGISTRY",
+                "actionName": "get_rows",
+                "input": {},
+                "inputUiInfo": {},
+                "errorHandlingOptions": {
+                  "continueOnFailure": {
+                    "value": false
+                  },
+                  "retryOnFailure": {
+                    "value": false
+                  }
+                }
+              },
+              "nextAction": {
+                "name": "clean",
+                "type": "CODE",
+                "valid": true,
+                "displayName": "01 · Clean & dedupe",
+                "settings": {
+                  "input": {
+                    "rows": "{{get_leads}}"
+                  },
+                  "sourceCode": {
+                    "code": "/**\n * Activepieces Code piece — Stack 1: Clean, Normalize, Resolve Buyers.\n *\n * Flow position:  Google Sheets (Get Rows)  ->  THIS Code step  ->  enrichment.\n *\n * INPUT  (define one input named `rows` in the Code piece UI, mapped to the\n *         Google Sheets action output — an array of row objects keyed by the\n *         sheet's column headers).\n *\n * OUTPUT { uniqueBuyers: [...], stats: {...} }\n *         One record per real-world buyer company, with every email / contact /\n *         domain / HS code / product seen across that buyer's rows merged in,\n *         and a `needsEnrichment` flag telling the next stack whether we still\n *         have to hunt for an email.\n */\n\nexport const code = async (inputs) => {\n  // Normalize whatever \"Get all rows\" hands us into header-keyed row objects.\n  // Handles: bare array; {rows|values|body:[...]}; rows nested under `values`;\n  // and the column-LETTER shape ({A,B,C...} with row 1 as the header).\n  const normSheet = (v) => {\n    let rows = Array.isArray(v) ? v\n      : (v && (Array.isArray(v.rows) ? v.rows\n        : Array.isArray(v.values) ? v.values\n        : Array.isArray(v.body) ? v.body : [])) || [];\n    if (!Array.isArray(rows)) rows = [];\n    rows = rows.map((r) => (r && typeof r.values === 'object' && r.values) ? { row: r.row, ...r.values } : r);\n    const lettered = rows.some((r) => r && (r.A !== undefined || r.B !== undefined));\n    if (!lettered) return rows;\n    const header = rows.find((r) => String(r.row) === '1') || rows[0];\n    if (!header) return [];\n    const map = {};\n    for (const [k, val] of Object.entries(header)) if (k !== 'row') map[k] = String(val).trim();\n    const out = [];\n    for (const r of rows) {\n      if (r === header || String(r.row) === '1') continue;\n      const obj = {};\n      if (r.row !== undefined) obj.row = r.row;\n      for (const [k, val] of Object.entries(r)) {\n        if (k === 'row') continue;\n        const name = map[k];\n        if (name) obj[name] = val;\n      }\n      out.push(obj);\n    }\n    return out;\n  };\n  let rows = normSheet(inputs.rows);\n\n  // ---- helpers -----------------------------------------------------------\n\n  const clean = (v) =>\n    (v === null || v === undefined ? '' : String(v))\n      .replace(/\\s+/g, ' ')\n      .trim();\n\n  // Free mailbox providers — a domain from one of these is NOT a company domain.\n  const FREE_MAIL = new Set([\n    'gmail.com', 'yahoo.com', 'yahoo.co.in', 'hotmail.com', 'outlook.com',\n    'live.com', 'aol.com', 'icloud.com', 'rediffmail.com', 'ymail.com',\n    'protonmail.com', 'gmx.com', 'mail.com', 'qq.com', '163.com', '126.com',\n  ]);\n\n  // Legal suffixes / noise stripped ONLY to build the dedupe key.\n  const LEGAL = [\n    'private limited', 'pvt ltd', 'pvt. ltd.', 'pvt', 'private', 'limited',\n    'ltd', 'llp', 'llc', 'inc', 'incorporated', 'corp', 'corporation',\n    'company', 'co', 'gmbh', 'ag', 'bv', 'nv', 'sa', 'srl', 'spa', 'pte',\n    'pte ltd', 'sdn bhd', 'sdn', 'bhd', 'plc', 'kg', 'oy', 'as', 'sas',\n    'the', 'and', '&',\n  ];\n\n  const EMAIL_RE = /[a-z0-9._%+\\-]+@[a-z0-9.\\-]+\\.[a-z]{2,}/gi;\n  const URL_RE = /((https?:\\/\\/)?(www\\.)?)([a-z0-9\\-]+\\.)+[a-z]{2,}(\\/[^\\s,;]*)?/gi;\n\n  // Ocean-carrier / customs boilerplate that shows up in Product Description and\n  // is pure noise for personalization. Anything from these markers on is dropped.\n  const BOILERPLATE_RE =\n    /(please note[\\s-]+quantity|cargo are based on the shipper|ocean carrier has no knowledge|shipper'?s load and co).*$/is;\n\n  // Pull a human-readable product label out of the messy description:\n  //  - prefer the SHIPPER_DESCRIPTION(...) or HSCD_DESCRIPTION(...) parenthetical\n  //  - strip trailing carrier boilerplate\n  //  - drop stray commas that sit mid-word from the broken CSV export\n  const productLabel = (desc) => {\n    let s = clean(desc);\n    const paren =\n      s.match(/SHIPPER_DESCRIPTION\\s*\\(([^)]+)\\)/i) ||\n      s.match(/HSCD_DESCRIPTION\\s*\\(([^)]+)\\)/i);\n    if (paren) s = paren[1];\n    s = s.replace(BOILERPLATE_RE, '');\n    // strip trade-data noise: HS/HTS codes, PO numbers, \"this shipment\"\n    s = s.replace(/\\b(HS(CD)?|HTS)\\s*(CODE)?\\s*[:#]?\\s*\\d[\\d.]*/ig, ' ');\n    s = s.replace(/\\bPO\\s*#?\\s*[:#]?\\s*[A-Z0-9]+/ig, ' ');\n    s = s.replace(/\\bthis shipment\\b/ig, ' ');\n    s = s.replace(/,(?=\\S)/g, ' ');   // \", \" left alone, \",X\" -> \" X\"\n    s = s.replace(/\\s+/g, ' ').trim().replace(/[,\\-]+$/, '').trim();\n    return s.slice(0, 120);\n  };\n\n  // First 6 digits group HS codes into one product family (482370 == 48237010).\n  const hsFamily = (code) => clean(code).replace(/\\D/g, '').slice(0, 6);\n\n  const dedupeKey = (name) => {\n    let k = clean(name).toLowerCase();\n    k = k.replace(/[.,/#!$%^*;:{}=\\-_`~()@'\"]/g, ' '); // punctuation -> space\n    k = k.replace(/\\s+/g, ' ').trim();\n    // strip legal suffix words (whole words only)\n    const parts = k.split(' ').filter((w) => w && !LEGAL.includes(w));\n    return parts.join(' ').trim();\n  };\n\n  const extractEmails = (text) => {\n    const found = clean(text).toLowerCase().match(EMAIL_RE) || [];\n    return found.map((e) => e.trim());\n  };\n\n  const domainOfEmail = (email) => {\n    const m = String(email).toLowerCase().match(/@([a-z0-9.\\-]+\\.[a-z]{2,})$/);\n    return m ? m[1] : '';\n  };\n\n  const extractDomain = (contactWeb, emails) => {\n    // 1) prefer an explicit website in Contact/Web\n    const urls = clean(contactWeb).toLowerCase().match(URL_RE) || [];\n    for (const u of urls) {\n      const host = u\n        .replace(/^https?:\\/\\//, '')\n        .replace(/^www\\./, '')\n        .split('/')[0]\n        .trim();\n      if (host && host.includes('.') && !host.includes('@')) return host;\n    }\n    // 2) otherwise derive from a non-free company email\n    for (const e of emails) {\n      const d = domainOfEmail(e);\n      if (d && !FREE_MAIL.has(d)) return d;\n    }\n    return '';\n  };\n\n  const phoneOf = (text) => {\n    const m = clean(text).match(/\\+?\\d[\\d\\s\\-()]{6,}\\d/);\n    return m ? m[0].trim() : '';\n  };\n\n  const addUniq = (arr, val) => {\n    const v = clean(val);\n    if (v && !arr.some((x) => x.toLowerCase() === v.toLowerCase())) arr.push(v);\n  };\n\n  // Role/department mailboxes that are NOT a person's name.\n  const ROLE_LOCALS = new Set(['info', 'sales', 'contact', 'hello', 'admin',\n    'office', 'support', 'enquiry', 'enquiries', 'inquiry', 'orders', 'order',\n    'purchasing', 'purchase', 'procurement', 'sourcing', 'buyer', 'import',\n    'imports', 'export', 'exports', 'accounts', 'finance', 'mail', 'general',\n    'marketing', 'team', 'customerservice', 'service', 'help', 'reception']);\n  const cap = (s) => s ? s[0].toUpperCase() + s.slice(1).toLowerCase() : '';\n\n  // Derive a person's name from a personal-looking email local-part.\n  // \"priya.sharma@acme.com\" -> {name:'Priya Sharma', first:'Priya'}; role\n  // inboxes and gibberish return null so we never greet a fake name.\n  const nameFromEmail = (email) => {\n    const local = String(email || '').toLowerCase().split('@')[0]\n      .replace(/\\d+/g, '').replace(/[._-]+/g, '.').replace(/^\\.|\\.$/g, '');\n    if (!local || ROLE_LOCALS.has(local)) return null;\n    const parts = local.split('.').filter(Boolean);\n    if (parts.length >= 2 && parts.every((p) => p.length >= 2)) {\n      return { name: parts.map(cap).join(' '), first: cap(parts[0]) };\n    }\n    // single token: only trust it as a first name if it's alphabetic & 3-12 chars\n    if (parts.length === 1 && /^[a-z]{3,12}$/.test(parts[0]) && !ROLE_LOCALS.has(parts[0])) {\n      return { name: cap(parts[0]), first: cap(parts[0]) };\n    }\n    return null;\n  };\n\n  // ---- fold rows into unique buyers -------------------------------------\n\n  const buyers = new Map();\n  let skipped = 0;\n\n  for (const raw0 of rows) {\n    // some Sheets versions nest the columns under `values`\n    const raw = (raw0 && typeof raw0.values === 'object' && raw0.values)\n      ? raw0.values : (raw0 || {});\n    const buyerName = clean(raw['Buyer']);\n    if (!buyerName) { skipped++; continue; }\n\n    const key = dedupeKey(buyerName);\n    if (!key) { skipped++; continue; }\n\n    const mailField = clean(raw['Mail ID']);\n    const contactField = clean(raw['Contact/Web']);\n    const emails = [\n      ...extractEmails(mailField),\n      ...extractEmails(contactField),\n    ].filter((e) => !FREE_MAIL.has(domainOfEmail(e)) || true); // keep all, flag later\n\n    if (!buyers.has(key)) {\n      buyers.set(key, {\n        buyerKey: key,\n        buyerName,               // display name (longest seen wins below)\n        domain: '',\n        emails: [],\n        freeEmails: [],          // gmail/yahoo etc. — usable but low-trust\n        phones: [],\n        websites: [],\n        hsCodes: [],\n        hsFamilies: [],\n        products: [],\n        productLabels: [],\n        origins: [],\n        destinations: [],\n        ports: [],\n        sellers: [],\n        assignedTo: [],\n        shipmentCount: 0,\n        lastDate: '',\n      });\n    }\n    const b = buyers.get(key);\n\n    // longest / most complete original name as the display name\n    if (buyerName.length > b.buyerName.length) b.buyerName = buyerName;\n\n    for (const e of emails) {\n      if (FREE_MAIL.has(domainOfEmail(e))) addUniq(b.freeEmails, e);\n      else addUniq(b.emails, e);\n    }\n\n    const ph = phoneOf(contactField);\n    if (ph) addUniq(b.phones, ph);\n\n    const dom = extractDomain(contactField, emails);\n    if (dom && !b.domain) b.domain = dom;\n    if (dom) addUniq(b.websites, dom);\n\n    addUniq(b.hsCodes, raw['HS Code']);\n    addUniq(b.hsFamilies, hsFamily(raw['HS Code']));\n    addUniq(b.products, raw['Product Description']);\n    addUniq(b.productLabels, productLabel(raw['Product Description']));\n    addUniq(b.origins, raw['Origin']);\n    addUniq(b.destinations, raw['Country of Destination'] || raw['Destination']);\n    addUniq(b.ports, raw['Port of Origin']);\n    addUniq(b.sellers, raw['Seller']);\n    addUniq(b.assignedTo, raw['Assigned To']);\n    b.shipmentCount += 1;\n\n    const d = clean(raw['Date']);\n    if (d && d > b.lastDate) b.lastDate = d;\n  }\n\n  // ---- finalize ----------------------------------------------------------\n\n  const uniqueBuyers = [...buyers.values()].map((b) => {\n    const hasCompanyEmail = b.emails.length > 0;\n    const hasAnyEmail = hasCompanyEmail || b.freeEmails.length > 0;\n\n    // Pull a SPOC name from any personal-looking email the sheet already had.\n    let spoc = null;\n    let spocEmail = '';\n    for (const e of [...b.emails, ...b.freeEmails]) {\n      const n = nameFromEmail(e);\n      if (n) { spoc = n; spocEmail = e; break; }\n    }\n\n    return {\n      ...b,\n      // prefer a named personal email as the primary contact when we have one\n      primaryEmail: spocEmail || b.emails[0] || b.freeEmails[0] || '',\n      spocName: spoc ? spoc.name : '',\n      spocFirstName: spoc ? spoc.first : '',\n      spocEmail,\n      // Skip the (rate-limited) email finder when we already have a company email.\n      needsEnrichment: !hasCompanyEmail,\n      hasAnyEmail,\n    };\n  });\n\n  // Most active buyers first — spend scarce free finder credits on these.\n  uniqueBuyers.sort((a, b) => b.shipmentCount - a.shipmentCount);\n\n  return {\n    uniqueBuyers,\n    stats: {\n      inputRows: rows.length,\n      skippedNoBuyer: skipped,\n      uniqueBuyers: uniqueBuyers.length,\n      alreadyHaveCompanyEmail: uniqueBuyers.filter((b) => !b.needsEnrichment).length,\n      needEnrichment: uniqueBuyers.filter((b) => b.needsEnrichment).length,\n    },\n  };\n};\n",
+                    "packageJson": "{\n  \"dependencies\": {}\n}"
+                  },
+                  "inputUiInfo": {
+                    "customizedInputs": {}
+                  },
+                  "errorHandlingOptions": {
+                    "continueOnFailure": {
+                      "value": false
+                    },
+                    "retryOnFailure": {
+                      "value": false
+                    }
+                  }
+                },
+                "nextAction": {
+                  "name": "precheck",
+                  "type": "CODE",
+                  "valid": true,
+                  "displayName": "CRM · Pre-check (dedup + cache)",
+                  "settings": {
+                    "input": {
+                      "buyers": "{{clean['uniqueBuyers']}}",
+                      "found": "{{get_found}}",
+                      "crmBaseUrl": "https://your-crm.example.com",
+                      "crmToken": ""
+                    },
+                    "sourceCode": {
+                      "code": "/**\n * Activepieces Code piece — CRM pre-check (dedup + already-found cache).\n *\n * Flow position:  01-clean  ->  THIS  ->  02-enrich.\n *\n * Runs BEFORE domain-finding so we never re-hunt a domain/mail for a company\n * we already know. Three signals, cheapest first:\n *\n *  1. **Already-found log** (the \"Found\" sheet this engine writes each run):\n *     if this buyer already has a domain/mail on file, reuse it and mark the\n *     buyer done — 02-enrich passes it straight through, no lookup spent.\n *  2. **The CRM** (`GET /lookup`): the source of truth. It answers from SQLite\n *     and includes disqualified/closed companies, so it is a strict superset of\n *     the CRM — asking the CRM already \"checks the CRM\", and unlike the CRM it won't\n *     re-surface a company we rejected last month. (Service B syncs SQLite ->\n *     the CRM; the CRM lags and drops closed companies, so a direct the CRM read here\n *     would be both redundant and worse — see deploy/ACTIVEPIECES.md.)\n *  3. Unknown -> let it through to enrichment.\n *\n * Classification per buyer:\n *   should_prospect / unknown  -> keep, enrich, pitch\n *   needs_address              -> keep, enrich to find an address, but DON'T\n *                                 pitch (the CRM queues it for follow-up)\n *   known & in-pipeline        -> drop (already being handled)\n *\n * Fail-open: any CRM error leaves the buyer in the pipeline rather than\n * silently dropping a real prospect. The Found-log cache still applies.\n *\n * INPUTS\n *   buyers      = 01.uniqueBuyers\n *   found       = Google Sheets \"Get rows\" on the Found log tab (may be lettered)\n *   crmBaseUrl  = default https://your-crm.example.com\n *   crmToken    = CRM_API_TOKEN (bearer). Leave blank to run cache-only.\n *\n * OUTPUT { buyers, skipped, stats }\n */\n\nexport const code = async (inputs) => {\n  const buyers = Array.isArray(inputs.buyers) ? inputs.buyers : [];\n  const base = String(inputs.crmBaseUrl || 'https://your-crm.example.com')\n    .replace(/\\/+$/, '');\n  const token = String(inputs.crmToken || '').trim();\n\n  // Normalize Google Sheets \"Get all rows\" into header-keyed rows — handles the\n  // lettered-column shape (A/B/C with row 1 as the header) this account returns.\n  const normSheet = (v) => {\n    let rows = Array.isArray(v) ? v\n      : (v && (Array.isArray(v.rows) ? v.rows\n        : Array.isArray(v.values) ? v.values\n        : Array.isArray(v.body) ? v.body : [])) || [];\n    if (!Array.isArray(rows)) rows = [];\n    rows = rows.map((r) => (r && typeof r.values === 'object' && r.values) ? { row: r.row, ...r.values } : r);\n    const lettered = rows.some((r) => r && (r.A !== undefined || r.B !== undefined));\n    if (!lettered) return rows;\n    const header = rows.find((r) => String(r.row) === '1') || rows[0];\n    if (!header) return [];\n    const map = {};\n    for (const [k, val] of Object.entries(header)) if (k !== 'row') map[k] = String(val).trim();\n    const out = [];\n    for (const r of rows) {\n      if (r === header || String(r.row) === '1') continue;\n      const obj = {};\n      if (r.row !== undefined) obj.row = r.row;\n      for (const [k, val] of Object.entries(r)) {\n        if (k === 'row') continue;\n        const name = map[k];\n        if (name) obj[name] = val;\n      }\n      out.push(obj);\n    }\n    return out;\n  };\n\n  const clean = (s) => (s === null || s === undefined ? '' : String(s)).replace(/\\s+/g, ' ').trim();\n  const lc = (s) => clean(s).toLowerCase();\n  const normDomain = (v) => {\n    const h = lc(v).replace(/^https?:\\/\\//, '').replace(/^www\\./, '').split('/')[0];\n    return h.includes('.') && !h.includes('@') && !h.includes(' ') ? h : '';\n  };\n\n  // ---- build the already-found cache from the Found log ------------------\n  const found = normSheet(inputs.found);\n  const cacheByKey = new Map();\n  const cachedDomains = new Set();\n  for (const r of found) {\n    const key = lc(r.buyerKey || r.buyerName);\n    const dom = normDomain(r.domain);\n    if (dom) cachedDomains.add(dom);\n    if (key && !cacheByKey.has(key)) {\n      cacheByKey.set(key, {\n        domain: dom,\n        spocName: clean(r.spocName),\n        spocEmail: clean(r.spocEmail),\n        mail: clean(r.mailFound || r.spocEmail),\n      });\n    }\n  }\n\n  const lookup = async ({ domain, name }) => {\n    if (!token) return null;\n    try {\n      const q = domain ? 'domain=' + encodeURIComponent(domain)\n        : 'name=' + encodeURIComponent(name);\n      const r = await fetch(base + '/lookup?' + q, {\n        headers: { Authorization: 'Bearer ' + token },\n        signal: AbortSignal.timeout(15000),\n      });\n      if (!r.ok) return null;\n      return await r.json();\n    } catch { return null; }\n  };\n  const sleep = (ms) => new Promise((res) => setTimeout(res, ms));\n\n  // ---- classify each buyer ----------------------------------------------\n  const out = [];\n  const skipped = [];\n  const stats = { input: buyers.length, cacheHits: 0, crmSkipped: 0,\n    needsAddress: 0, toEnrich: 0, lookupErrors: 0, kept: 0 };\n\n  for (const b of buyers) {\n    const key = lc(b.buyerKey || b.buyerName);\n    const sheetDomain = normDomain(b.domain);\n\n    // 1) already-found: reuse cached domain/mail, no lookup, skip enrichment\n    const cached = cacheByKey.get(key)\n      || (sheetDomain && cachedDomains.has(sheetDomain) ? { domain: sheetDomain } : null);\n    if (cached && cached.domain) {\n      const mail = b.primaryEmail || cached.mail || '';\n      stats.cacheHits++; stats.kept++;\n      out.push({ ...b,\n        domain: b.domain || cached.domain,\n        primaryEmail: mail,\n        spocName: b.spocName || cached.spocName || '',\n        needsEnrichment: false,\n        enrichStatus: mail ? 'role_inbox_ready' : (b.enrichStatus || 'cached'),\n        dedupe: 'cache' });\n      continue;\n    }\n\n    // 2) ask the CRM (covers the CRM). Prefer a domain match; fall back to name.\n    const info = await lookup({ domain: sheetDomain, name: b.buyerName });\n    await sleep(120);\n    if (info === null && token) stats.lookupErrors++;\n\n    if (info && info.known && info.should_prospect === false && !info.needs_address) {\n      stats.crmSkipped++;\n      skipped.push({ buyerKey: b.buyerKey, buyerName: b.buyerName,\n        reason: 'in_pipeline', stage: info.stage });\n      continue; // already handled — don't enrich, don't pitch\n    }\n    if (info && info.needs_address) {\n      stats.needsAddress++; stats.kept++;\n      out.push({ ...b, needsAddress: true,\n        crmCompanyId: info.company_id || null, dedupe: 'crm_needs_address' });\n      continue;\n    }\n    stats.toEnrich++; stats.kept++;\n    out.push({ ...b, dedupe: info && info.known ? 'crm_known' : 'new' });\n  }\n\n  return { buyers: out, skipped, stats };\n};\n",
+                      "packageJson": "{\n  \"dependencies\": {}\n}"
+                    },
+                    "inputUiInfo": {
+                      "customizedInputs": {}
+                    },
+                    "errorHandlingOptions": {
+                      "continueOnFailure": {
+                        "value": false
+                      },
+                      "retryOnFailure": {
+                        "value": false
+                      }
+                    }
+                  },
+                  "nextAction": {
+                    "name": "enrich",
+                    "type": "CODE",
+                    "valid": true,
+                    "displayName": "02 · Enrich (domain + role inbox)",
+                    "settings": {
+                      "input": {
+                        "buyers": "{{precheck['buyers']}}"
+                      },
+                      "sourceCode": {
+                        "code": "/**\n * Activepieces Code piece — Stack 2: ICP filter + Domain + Email candidates.\n *\n * Flow position:  Stack-1 Code  ->  THIS Code step  ->  personalization.\n *\n * Zero-cost, no-key, unlimited backbone:\n *   - Clearbit autocomplete  (company name -> domain)   free, no key\n *   - Google DNS-over-HTTPS  (MX check, domain accepts mail?)   free, no key\n *   - Role-inbox permutation (sales@ / purchasing@ ...)   free, unlimited\n *\n * Named decision-maker (SPOC) lookup is intentionally NOT here: there is no\n * free, no-scrape, no-limit source for a person's name at volume. Reserve a\n * paid finder (Apollo/Hunter) for your top buyers and call it from a separate\n * step gated on `icpScore`. This piece gets you a deliverable role inbox for\n * free, which the bounce handler in the send stack de-facto verifies.\n *\n * INPUT  (input `buyers` = Stack-1 uniqueBuyers array; only needsEnrichment\n *         items are processed, the rest pass through untouched)\n *\n * OUTPUT { enriched: [...], stats: {...} }\n */\n\nexport const code = async (inputs) => {\n  const buyers = Array.isArray(inputs.buyers) ? inputs.buyers : [];\n\n  // ---- ICP config (Acme: compostable sugarcane bagasse tableware) -----\n  const ICP_KEYWORDS = [\n    'bagasse', 'tableware', 'compostable', 'molded fiber', 'moulded fibre',\n    'clamshell', 'plate', 'bowl', 'cup', 'container', 'egg ctn', 'egg carton',\n    'paper pulp', 'pressed molded', 'disposable', 'foodservice', 'cutlery',\n    'dishware', 'tray',\n  ];\n  const ICP_HS_FAMILIES = ['482370', '482361', '482369']; // pulp/paper tableware\n  const ROLE_PREFIXES = [\n    'purchasing', 'procurement', 'purchase', 'sourcing', 'buyer',\n    'sales', 'info', 'contact', 'hello', 'import', 'orders',\n  ];\n\n  // ---- helpers -----------------------------------------------------------\n  const norm = (s) =>\n    String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\\s+/g, ' ').trim();\n\n  const STOP = new Set(['the', 'and', 'llc', 'inc', 'ltd', 'co', 'corp',\n    'corporation', 'company', 'group', 'international', 'enterprises',\n    'solution', 'solutions', 'pvt', 'private', 'limited', 'services',\n    'trading', 'exports', 'imports',\n    // trailing geography common in trade data (\"Reynolds ... Canada Inc\")\n    'usa', 'us', 'uk', 'uae', 'canada', 'mexico', 'singapore', 'malaysia',\n    'australia', 'germany', 'france', 'netherlands', 'vietnam', 'thailand',\n    'europe', 'asia', 'africa', 'worldwide', 'overseas', 'intl']);\n\n  // significant tokens: drop stopwords and 1-char fragments\n  const tokens = (s) =>\n    norm(s).split(' ').filter((t) => t.length >= 2 && !STOP.has(t));\n\n  // common generic words that must not stand alone as a high-confidence match\n  const COMMON = new Set(['shop', 'store', 'food', 'foods', 'global', 'world',\n    'trade', 'star', 'king', 'gold', 'sun', 'eco', 'green', 'pack', 'packaging',\n    'india', 'export', 'import', 'universal', 'national', 'general', 'united']);\n\n  // coverage = fraction of the BUYER's significant tokens that appear in the\n  // candidate company name. High-confidence requires 1.0 (every buyer word\n  // present) so \"Bahamas Food Services\" does NOT match tourism site \"Bahamas\".\n  const coverage = (buyerName, candidateName) => {\n    const A = tokens(buyerName);        // array -> use .length\n    const B = new Set(tokens(candidateName)); // set -> use .size\n    if (!A.length || !B.size) return 0;\n    let hit = 0;\n    for (const t of A) if (B.has(t)) hit++;\n    return hit / A.length;\n  };\n\n  const icpScore = (b) => {\n    const text = norm((b.productLabels || []).concat(b.products || []).join(' '));\n    const kw = ICP_KEYWORDS.filter((k) => text.includes(norm(k))).length;\n    const hsHit = (b.hsFamilies || []).some((h) => ICP_HS_FAMILIES.includes(h));\n    // volume signal: repeated shipments = a real distributor, not a one-off\n    const vol = Math.min(b.shipmentCount || 1, 5);\n    let score = kw * 2 + (hsHit ? 3 : 0) + vol;\n    // penalize obvious one-off noise (single shipment, no keyword match)\n    if (kw === 0 && (b.shipmentCount || 1) <= 1) score -= 3;\n    return score;\n  };\n\n  const suggest = async (query) => {\n    try {\n      const r = await fetch(\n        'https://autocomplete.clearbit.com/v1/companies/suggest?query=' +\n          encodeURIComponent(query),\n        { signal: AbortSignal.timeout(8000) },\n      );\n      const list = await r.json();\n      return Array.isArray(list) ? list : [];\n    } catch { return []; }\n  };\n\n  const clearbitDomain = async (name) => {\n    // Clearbit is a PREFIX match: \"Sysco Corporation\" -> 0, \"Sysco\" -> hits.\n    // Strip legal noise and try progressively shorter queries until one hits.\n    const tk = tokens(name);\n    const queries = [...new Set([\n      tk.join(' '),\n      tk.slice(0, 2).join(' '),\n      tk.slice(0, 1).join(' '),\n    ].filter(Boolean))];\n\n    let list = [];\n    for (const q of queries) {\n      list = await suggest(q);\n      if (list.length) break;\n      await sleep(150);\n    }\n    if (!list.length) return null;\n\n    // pick the candidate with the highest buyer-token coverage\n    let best = null;\n    let bestCov = 0;\n    for (const c of list) {\n      const cov = coverage(name, c.name);\n      if (cov > bestCov) { bestCov = cov; best = c; }\n    }\n    best = best || list[0];\n\n    // 'high' only when the full buyer name is covered — otherwise it's a guess.\n    let confidence = bestCov >= 0.999 ? 'high' : 'low';\n\n    // Extra guard: a buyer name that collapses to ONE short/generic token\n    // (e.g. \"E SHOP ENTERPRISES\" -> \"shop\") matches too many unrelated brands.\n    // Require review unless that single token is distinctive (len >= 5, not common).\n    const bt = tokens(name);\n    if (confidence === 'high' && bt.length === 1) {\n      const t = bt[0];\n      if (t.length < 5 || COMMON.has(t)) confidence = 'low';\n    }\n    return { domain: best.domain, confidence, matchedName: best.name, coverage: bestCov };\n  };\n\n  const hasMX = async (domain) => {\n    try {\n      const r = await fetch(\n        'https://dns.google/resolve?name=' + domain + '&type=MX',\n        { signal: AbortSignal.timeout(8000) },\n      );\n      const j = await r.json();\n      return Array.isArray(j.Answer) && j.Answer.length > 0;\n    } catch { return false; }\n  };\n\n  const sleep = (ms) => new Promise((res) => setTimeout(res, ms));\n\n  // ---- process -----------------------------------------------------------\n  const enriched = [];\n  let resolved = 0;\n  let noDomain = 0;\n  let filteredOut = 0;\n  let needsReview = 0;\n\n  for (const b of buyers) {\n    const score = icpScore(b);\n    const record = { ...b, icpScore: score };\n\n    // buyers we already have an email for: ready to send, no lookup needed\n    if (!b.needsEnrichment) {\n      enriched.push({ ...record,\n        enrichStatus: b.primaryEmail ? 'role_inbox_ready' : 'needs_review' });\n      continue;\n    }\n\n    // ICP gate: don't spend lookups on off-target one-offs\n    if (score < 2) {\n      filteredOut++;\n      enriched.push({ ...record, enrichStatus: 'skipped_low_icp',\n        emailCandidates: [], primaryEmail: '' });\n      continue;\n    }\n\n    const hit = await clearbitDomain(b.buyerName);\n    await sleep(250); // be polite to the free endpoint\n\n    if (!hit || !hit.domain) {\n      noDomain++;\n      enriched.push({ ...record, enrichStatus: 'no_domain_free',\n        domain: '', emailCandidates: [], primaryEmail: '' });\n      continue;\n    }\n\n    const domain = hit.domain;\n\n    // Low-confidence match = likely the wrong company. Do NOT auto-email it;\n    // park it for human/paid review so we never cold-mail a random domain.\n    if (hit.confidence !== 'high') {\n      needsReview++;\n      enriched.push({\n        ...record, domain,\n        domainConfidence: 'low', matchedName: hit.matchedName,\n        emailCandidates: [], primaryEmail: '',\n        enrichStatus: 'needs_review',\n      });\n      continue;\n    }\n\n    const mx = await hasMX(domain);\n    await sleep(200);\n\n    const candidates = mx ? ROLE_PREFIXES.map((p) => `${p}@${domain}`) : [];\n    resolved += candidates.length ? 1 : 0;\n\n    enriched.push({\n      ...record,\n      domain,\n      domainConfidence: hit.confidence,\n      matchedName: hit.matchedName,\n      hasMX: mx,\n      emailCandidates: candidates,\n      primaryEmail: candidates[0] || '',      // purchasing@ preferred\n      enrichStatus: mx ? 'role_inbox_ready' : 'domain_no_mx',\n    });\n  }\n\n  return {\n    enriched,\n    stats: {\n      inputBuyers: buyers.length,\n      resolvedRoleInbox: resolved,\n      needsReview,\n      noDomainFree: noDomain,\n      filteredLowIcp: filteredOut,\n    },\n  };\n};\n",
+                        "packageJson": "{\n  \"dependencies\": {}\n}"
+                      },
+                      "inputUiInfo": {
+                        "customizedInputs": {}
+                      },
+                      "errorHandlingOptions": {
+                        "continueOnFailure": {
+                          "value": false
+                        },
+                        "retryOnFailure": {
+                          "value": false
+                        }
+                      }
+                    },
+                    "nextAction": {
+                      "name": "fallback",
+                      "type": "CODE",
+                      "valid": true,
+                      "displayName": "02b · Domain fallback",
+                      "settings": {
+                        "input": {
+                          "enriched": "{{enrich['enriched']}}",
+                          "braveApiKey": "",
+                          "serperApiKey": "",
+                          "tavilyApiKey": ""
+                        },
+                        "sourceCode": {
+                          "code": "/**\n * Activepieces Code piece — Stack 2b: Fallback domain finder CASCADE.\n *\n * Runs on buyers Stack 2 left unresolved (needs_review / no_domain_free) that\n * clear an ICP threshold. Tries search services in order until one yields the\n * company's real website, validated against a directory/marketplace blocklist\n * and the same strict token gate as Stack 2, then MX-checks and builds role\n * inboxes. First hit wins; later services only run if earlier ones came up empty.\n *\n *   1) Brave Search API   (header X-Subscription-Token)\n *   2) Serper.dev         (Google results, header X-API-KEY)\n *   3) Tavily             (AI search, api_key in body)\n *\n * INPUTS:\n *   enriched       = Stack-2 `enriched` array\n *   braveApiKey    | serperApiKey | tavilyApiKey  (any subset; missing = skipped)\n *   maxLookups     = cap on buyers to resolve per run (default 40)\n *   icpThreshold   = min icpScore to bother (default 4)\n *\n * OUTPUT { enriched, stats }\n */\n\nexport const code = async (inputs) => {\n  const rows = Array.isArray(inputs.enriched) ? inputs.enriched : [];\n  const braveKey = inputs.braveApiKey || '';\n  const serperKey = inputs.serperApiKey || '';\n  const tavilyKey = inputs.tavilyApiKey || '';\n  const maxLookups = Number(inputs.maxLookups) > 0 ? Number(inputs.maxLookups) : 40;\n  const icpThreshold = Number(inputs.icpThreshold) >= 0 ? Number(inputs.icpThreshold) : 4;\n\n  const ROLE_PREFIXES = ['purchasing', 'procurement', 'purchase', 'sourcing',\n    'buyer', 'sales', 'info', 'contact', 'hello', 'import', 'orders'];\n\n  const BLOCKLIST = ['importyeti', 'panjiva', 'zauba', 'volza', 'seair',\n    'exportgenius', 'importgenius', 'tradeindia', 'indiamart', 'alibaba',\n    'made-in-china', 'linkedin', 'facebook', 'instagram', 'twitter', 'x.com',\n    'youtube', 'crunchbase', 'bloomberg', 'dnb.com', 'zoominfo', 'wikipedia',\n    'google.', 'amazon.', 'yelp', 'glassdoor', 'justdial', 'yellowpages',\n    'opencorporates', 'trademap', 'kompass', 'europages'];\n\n  const norm = (s) => String(s || '').toLowerCase()\n    .replace(/[^a-z0-9]+/g, ' ').replace(/\\s+/g, ' ').trim();\n  const STOP = new Set(['the', 'and', 'llc', 'inc', 'ltd', 'co', 'corp',\n    'corporation', 'company', 'group', 'international', 'enterprises', 'solution',\n    'solutions', 'pvt', 'private', 'limited', 'services', 'trading', 'exports', 'imports']);\n  const COMMON = new Set(['shop', 'store', 'food', 'foods', 'global', 'world',\n    'trade', 'star', 'king', 'gold', 'sun', 'eco', 'green', 'pack', 'packaging',\n    'india', 'export', 'import', 'universal', 'national', 'general', 'united']);\n  const tokens = (s) => norm(s).split(' ').filter((t) => t.length >= 2 && !STOP.has(t));\n  const coverage = (buyer, cand) => {\n    const A = tokens(buyer); const B = new Set(tokens(cand));\n    if (!A.length || !B.size) return 0;\n    let h = 0; for (const t of A) if (B.has(t)) h++; return h / A.length;\n  };\n  const rootLabel = (d) => String(d || '').replace(/^www\\./, '').split('.')[0];\n  const blocked = (host) => BLOCKLIST.some((b) => host.includes(b));\n  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));\n\n  // ---- search services (return [{url,title}]) ---------------------------\n  const braveSearch = async (q) => {\n    const r = await fetch('https://api.search.brave.com/res/v1/web/search?count=5&q=' +\n      encodeURIComponent(q), {\n      headers: { 'X-Subscription-Token': braveKey, 'Accept': 'application/json' },\n      signal: AbortSignal.timeout(10000),\n    });\n    const j = await r.json();\n    return ((j.web && j.web.results) || []).map((x) => ({ url: x.url, title: x.title }));\n  };\n  const serperSearch = async (q) => {\n    const r = await fetch('https://google.serper.dev/search', {\n      method: 'POST',\n      headers: { 'X-API-KEY': serperKey, 'Content-Type': 'application/json' },\n      body: JSON.stringify({ q, num: 5 }), signal: AbortSignal.timeout(10000),\n    });\n    const j = await r.json();\n    return (j.organic || []).map((x) => ({ url: x.link, title: x.title }));\n  };\n  const tavilySearch = async (q) => {\n    const r = await fetch('https://api.tavily.com/search', {\n      method: 'POST', headers: { 'Content-Type': 'application/json' },\n      body: JSON.stringify({ api_key: tavilyKey, query: q, max_results: 5, search_depth: 'basic' }),\n      signal: AbortSignal.timeout(12000),\n    });\n    const j = await r.json();\n    return (j.results || []).map((x) => ({ url: x.url, title: x.title }));\n  };\n\n  const services = [];\n  if (braveKey) services.push({ name: 'brave', fn: braveSearch });\n  if (serperKey) services.push({ name: 'serper', fn: serperSearch });\n  if (tavilyKey) services.push({ name: 'tavily', fn: tavilySearch });\n\n  // pick a valid company domain from a service's results\n  const pickDomain = (items, buyerName) => {\n    const bt = tokens(buyerName);\n    for (const it of items) {\n      let host = '';\n      try { host = new URL(it.url).hostname.replace(/^www\\./, '').toLowerCase(); }\n      catch { continue; }\n      if (!host || blocked(host)) continue;\n      const label = rootLabel(host);\n      const strongTok = bt.find((t) => t.length >= 5 && !COMMON.has(t) && label.includes(t));\n      const cov = coverage(buyerName, it.title || '');\n      if (strongTok || cov >= 0.999) {\n        return { domain: host, matchedVia: strongTok ? 'domain-label' : 'title' };\n      }\n    }\n    return null;\n  };\n\n  const hasMX = async (domain) => {\n    try {\n      const r = await fetch('https://dns.google/resolve?name=' + domain + '&type=MX',\n        { signal: AbortSignal.timeout(8000) });\n      const j = await r.json();\n      return Array.isArray(j.Answer) && j.Answer.length > 0;\n    } catch { return false; }\n  };\n\n  // ---- process -----------------------------------------------------------\n  const out = [];\n  let resolved = 0, stillReview = 0, capReached = 0;\n  const svcCalls = {};\n  let lookups = 0;\n\n  for (const b of rows) {\n    const retryable = b.enrichStatus === 'needs_review' || b.enrichStatus === 'no_domain_free';\n    if (!retryable) { out.push(b); continue; }\n    if ((b.icpScore || 0) < icpThreshold) { out.push(b); stillReview++; continue; }\n    if (!services.length) { out.push(b); stillReview++; continue; }\n    if (lookups >= maxLookups) { capReached++; out.push({ ...b, enrichStatus: 'needs_review_cap' }); continue; }\n\n    lookups++;\n    const country = (b.destinations && b.destinations[0]) || '';\n    const query = `${b.buyerName} ${country} official website`.trim();\n\n    let hit = null, via = '';\n    for (const svc of services) {\n      try {\n        const items = await svc.fn(query);\n        svcCalls[svc.name] = (svcCalls[svc.name] || 0) + 1;\n        const picked = pickDomain(items, b.buyerName);\n        await sleep(250);\n        if (picked) { hit = picked.domain; via = svc.name + '_' + picked.matchedVia; break; }\n      } catch { /* try next service */ }\n    }\n\n    if (!hit) { out.push({ ...b, enrichStatus: 'needs_review' }); stillReview++; continue; }\n\n    const mx = await hasMX(hit); await sleep(150);\n    const candidates = mx ? ROLE_PREFIXES.map((p) => `${p}@${hit}`) : [];\n    if (candidates.length) resolved++;\n    out.push({\n      ...b, domain: hit, domainConfidence: 'high', domainSource: via, hasMX: mx,\n      emailCandidates: candidates, primaryEmail: candidates[0] || '',\n      enrichStatus: mx ? 'role_inbox_ready' : 'domain_no_mx',\n    });\n  }\n\n  return {\n    enriched: out,\n    stats: { inputBuyers: rows.length, lookups, resolvedRoleInbox: resolved,\n      stillNeedsReview: stillReview, skippedCapReached: capReached, serviceCalls: svcCalls },\n  };\n};\n",
+                          "packageJson": "{\n  \"dependencies\": {}\n}"
+                        },
+                        "inputUiInfo": {
+                          "customizedInputs": {}
+                        },
+                        "errorHandlingOptions": {
+                          "continueOnFailure": {
+                            "value": false
+                          },
+                          "retryOnFailure": {
+                            "value": false
+                          }
+                        }
+                      },
+                      "nextAction": {
+                        "name": "people",
+                        "type": "CODE",
+                        "valid": true,
+                        "displayName": "02c · People finder",
+                        "settings": {
+                          "input": {
+                            "enriched": "{{fallback['enriched']}}",
+                            "hunterApiKey": "",
+                            "apolloApiKey": "",
+                            "snovClientId": "",
+                            "snovClientSecret": ""
+                          },
+                          "sourceCode": {
+                            "code": "/**\n * Activepieces Code piece — Stack 2c: People / mail finder CASCADE.\n *\n * Once a buyer has a domain, find the real decision-maker(s) — name, title and\n * email — preferring procurement/purchasing roles. Tries services in order,\n * first that returns a usable person wins; up to 2 SPOCs kept. When found, the\n * buyer's primaryEmail is upgraded from the role inbox to the person's email,\n * and spocFirstName drives the greeting (\"Hi Priya,\").\n *\n *   1) Hunter.io   (Domain Search: name+title+department+email)  api_key\n *   2) Apollo.io   (People Search)                               X-Api-Key\n *   3) Snov.io     (OAuth token -> domain emails with info)      client id+secret\n *\n * Runs only on role_inbox_ready buyers that clear ICP and don't already have a\n * name (from the sheet), so credits aren't wasted.\n *\n * INPUTS:\n *   enriched        = Stack-2b `enriched` array\n *   hunterApiKey\n *   apolloApiKey\n *   snovClientId, snovClientSecret\n *   maxLookups      = cap per run (default 25)\n *   icpThreshold    = default 4\n *\n * OUTPUT { enriched, stats }\n */\n\nexport const code = async (inputs) => {\n  const rows = Array.isArray(inputs.enriched) ? inputs.enriched : [];\n  const hunterKey = inputs.hunterApiKey || '';\n  const apolloKey = inputs.apolloApiKey || '';\n  const snovId = inputs.snovClientId || '';\n  const snovSecret = inputs.snovClientSecret || '';\n  const maxLookups = Number(inputs.maxLookups) > 0 ? Number(inputs.maxLookups) : 25;\n  const icpThreshold = Number(inputs.icpThreshold) >= 0 ? Number(inputs.icpThreshold) : 4;\n\n  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));\n  const cap = (s) => s ? s[0].toUpperCase() + s.slice(1).toLowerCase() : '';\n  const clean = (s) => String(s || '').trim();\n\n  // rank a title: procurement roles first, then owners/execs, then managers\n  const titleScore = (title) => {\n    const t = String(title || '').toLowerCase();\n    if (/purchas|procure|sourc|supply|buyer|vendor/.test(t)) return 3;\n    if (/owner|founder|proprietor|ceo|president|managing director|principal/.test(t)) return 2;\n    if (/director|head|manager|vp|chief|purchase/.test(t)) return 1;\n    return 0;\n  };\n\n  // normalize a service's people list -> [{name,first,title,email,confidence}]\n  const rankPeople = (people) => {\n    const seen = new Set();\n    return people\n      .filter((p) => p && p.email && String(p.email).includes('@'))\n      .map((p) => {\n        const first = cap(clean(p.first));\n        const last = cap(clean(p.last));\n        return {\n          name: [first, last].filter(Boolean).join(' '),\n          first, title: clean(p.title), email: clean(p.email).toLowerCase(),\n          confidence: Number(p.confidence || 0), score: titleScore(p.title),\n        };\n      })\n      .filter((p) => { if (seen.has(p.email)) return false; seen.add(p.email); return true; })\n      .sort((a, b) => (b.score - a.score) || (b.confidence - a.confidence))\n      .slice(0, 2);\n  };\n\n  // ---- services (each returns raw people [{first,last,title,email,confidence}]) ----\n  const hunter = async (domain) => {\n    const r = await fetch('https://api.hunter.io/v2/domain-search?limit=10&domain=' +\n      encodeURIComponent(domain) + '&api_key=' + encodeURIComponent(hunterKey),\n      { signal: AbortSignal.timeout(12000) });\n    const j = await r.json();\n    const emails = (j.data && j.data.emails) || [];\n    return emails.map((e) => ({ first: e.first_name, last: e.last_name,\n      title: e.position || e.department, email: e.value, confidence: e.confidence }));\n  };\n\n  const apollo = async (domain) => {\n    const r = await fetch('https://api.apollo.io/v1/mixed_people/search', {\n      method: 'POST',\n      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache',\n        'X-Api-Key': apolloKey },\n      body: JSON.stringify({\n        q_organization_domains: domain,\n        person_titles: ['purchasing', 'procurement', 'sourcing', 'buyer',\n          'supply chain', 'owner', 'founder', 'director'],\n        page: 1, per_page: 10,\n      }),\n      signal: AbortSignal.timeout(12000),\n    });\n    const j = await r.json();\n    return (j.people || []).map((p) => ({ first: p.first_name, last: p.last_name,\n      title: p.title, email: p.email, confidence: 0 }));\n  };\n\n  let snovToken = null;\n  const snov = async (domain) => {\n    if (!snovToken) {\n      const tr = await fetch('https://api.snov.io/v1/oauth/access_token', {\n        method: 'POST', headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ grant_type: 'client_credentials',\n          client_id: snovId, client_secret: snovSecret }),\n        signal: AbortSignal.timeout(12000),\n      });\n      const tj = await tr.json();\n      snovToken = tj.access_token;\n      if (!snovToken) throw new Error('snov auth failed');\n    }\n    const r = await fetch('https://api.snov.io/v2/domain-emails-with-info', {\n      method: 'POST',\n      headers: { 'Authorization': 'Bearer ' + snovToken, 'Content-Type': 'application/json' },\n      body: JSON.stringify({ domain, type: 'personal', limit: 10, lastId: 0 }),\n      signal: AbortSignal.timeout(12000),\n    });\n    const j = await r.json();\n    return (j.emails || []).map((e) => ({ first: e.firstName, last: e.lastName,\n      title: e.position, email: e.email, confidence: 0 }));\n  };\n\n  const services = [];\n  if (hunterKey) services.push({ name: 'hunter', fn: hunter });\n  if (apolloKey) services.push({ name: 'apollo', fn: apollo });\n  if (snovId && snovSecret) services.push({ name: 'snov', fn: snov });\n\n  // ---- process -----------------------------------------------------------\n  const out = [];\n  let found = 0, notFound = 0, capReached = 0, lookups = 0;\n  const svcHits = {};\n\n  for (const b of rows) {\n    const eligible = b.enrichStatus === 'role_inbox_ready' && b.domain &&\n      !b.spocFirstName && (b.icpScore || 0) >= icpThreshold;\n    if (!eligible) { out.push(b); continue; }\n    if (!services.length) { out.push(b); continue; }\n    if (lookups >= maxLookups) { capReached++; out.push(b); continue; }\n\n    lookups++;\n    let spocs = [];\n    let source = '';\n    for (const svc of services) {\n      try {\n        const people = await svc.fn(b.domain);\n        await sleep(300);\n        const ranked = rankPeople(people || []);\n        if (ranked.length) { spocs = ranked; source = svc.name; svcHits[svc.name] = (svcHits[svc.name] || 0) + 1; break; }\n      } catch { /* next service */ }\n    }\n\n    if (!spocs.length) { notFound++; out.push(b); continue; }\n\n    const primary = spocs[0];\n    found++;\n    out.push({\n      ...b,\n      spocName: primary.name,\n      spocFirstName: primary.first,\n      spocTitle: primary.title,\n      spocEmail: primary.email,\n      spocs,\n      spocSource: source,\n      // email the real person instead of the role inbox\n      primaryEmail: primary.email || b.primaryEmail,\n    });\n  }\n\n  return {\n    enriched: out,\n    stats: { inputBuyers: rows.length, lookups, spocFound: found,\n      spocNotFound: notFound, skippedCapReached: capReached, serviceHits: svcHits },\n  };\n};\n",
+                            "packageJson": "{\n  \"dependencies\": {}\n}"
+                          },
+                          "inputUiInfo": {
+                            "customizedInputs": {}
+                          },
+                          "errorHandlingOptions": {
+                            "continueOnFailure": {
+                              "value": false
+                            },
+                            "retryOnFailure": {
+                              "value": false
+                            }
+                          }
+                        },
+                        "nextAction": {
+                          "name": "report",
+                          "type": "CODE",
+                          "valid": true,
+                          "displayName": "CRM · Report (ingest + gate)",
+                          "settings": {
+                            "input": {
+                              "buyers": "{{people['enriched']}}",
+                              "crmBaseUrl": "https://your-crm.example.com",
+                              "crmToken": ""
+                            },
+                            "sourceCode": {
+                              "code": "/**\n * Activepieces Code piece — CRM report (ingest + domain gate + found log).\n *\n * Flow position:  enrichment (02 / 02b / 02c)  ->  THIS  ->  03-personalize.\n *\n * Three jobs, once enrichment has resolved domains:\n *\n *  1. **Reliable domain gate.** crm-precheck deduped cheaply on name; now that\n *     we have a domain, a second `GET /lookup?domain=` catches the same company\n *     under a different name (\"Ecoware India\" vs \"Ecoware NZ\") and drops it if\n *     it is already in the pipeline. Cache hits skip this — they were already\n *     confirmed known.\n *  2. **Report to the CRM** (`POST /ingest`): one batch of `company` and\n *     `contact` records. Identity only; the CRM owns the CRM. NEVER a send event —\n *     the CRM reads sends from the mailbox and rejects reported sends with 422.\n *     Idempotent, so a retried step is a no-op.\n *  3. **Emit outputs:** `toPersonalize` (prospects ready to pitch) and\n *     `foundLog` (one row per company we resolved a domain for, to append to\n *     the Found sheet so next run's crm-precheck reuses it).\n *\n * `needs_address` buyers are reported (so the CRM learns the address) but NOT\n * put in `toPersonalize` — the CRM queues them for follow-up, we don't cold-pitch.\n *\n * INPUTS\n *   buyers      = the enriched array (02c.enriched, or 02b/02.enriched)\n *   crmBaseUrl  = default https://your-crm.example.com\n *   crmToken    = CRM_API_TOKEN (bearer). Blank -> report is skipped, pipeline\n *                 still runs (nothing lands in the CRM).\n *   batch       = optional batch id (defaults to a timestamp)\n *\n * OUTPUT { toPersonalize, foundLog, ingest, records, stats }\n */\n\nexport const code = async (inputs) => {\n  const buyers = Array.isArray(inputs.buyers) ? inputs.buyers : [];\n  const base = String(inputs.crmBaseUrl || 'https://your-crm.example.com')\n    .replace(/\\/+$/, '');\n  const token = String(inputs.crmToken || '').trim();\n  const batch = String(inputs.batch || ('A-' + new Date().toISOString().slice(0, 19)));\n\n  const clean = (s) => (s === null || s === undefined ? '' : String(s)).replace(/\\s+/g, ' ').trim();\n  const normDomain = (v) => {\n    const h = clean(v).toLowerCase().replace(/^https?:\\/\\//, '').replace(/^www\\./, '').split('/')[0];\n    return h.includes('.') && !h.includes('@') && !h.includes(' ') ? h : '';\n  };\n  const nowIso = new Date().toISOString();\n  const sleep = (ms) => new Promise((res) => setTimeout(res, ms));\n\n  const lookup = async (domain) => {\n    if (!token || !domain) return null;\n    try {\n      const r = await fetch(base + '/lookup?domain=' + encodeURIComponent(domain), {\n        headers: { Authorization: 'Bearer ' + token },\n        signal: AbortSignal.timeout(15000),\n      });\n      if (!r.ok) return null;\n      return await r.json();\n    } catch { return null; }\n  };\n\n  const toPersonalize = [];\n  const foundLog = [];\n  const records = [];\n  const seenCompany = new Set();\n  const stats = { input: buyers.length, prospects: 0, needsAddress: 0,\n    domainDupSkipped: 0, companies: 0, contacts: 0 };\n\n  for (const b of buyers) {\n    const domain = normDomain(b.domain);\n\n    // log every company we resolved a domain for (drives next run's cache)\n    if (domain) {\n      foundLog.push({\n        buyerKey: b.buyerKey || '', buyerName: b.buyerName || '',\n        domain, domainConfidence: b.domainConfidence || '',\n        spocName: b.spocName || '', spocEmail: b.spocEmail || '',\n        mailFound: b.primaryEmail || '', enrichStatus: b.enrichStatus || '',\n        foundAt: nowIso,\n      });\n    }\n    if (!domain) continue;\n\n    // reliable domain gate — only for freshly enriched buyers (cache hits and\n    // needs_address were already resolved by crm-precheck)\n    if (b.dedupe !== 'cache' && b.dedupe !== 'crm_needs_address') {\n      const info = await lookup(domain);\n      await sleep(120);\n      if (info && info.known && info.should_prospect === false && !info.needs_address) {\n        stats.domainDupSkipped++;\n        continue; // same company under another name — already in the pipeline\n      }\n    }\n\n    // report the company (one per domain, idempotent)\n    if (!seenCompany.has(domain)) {\n      seenCompany.add(domain);\n      records.push({ op: 'company', name: b.buyerName || domain, domain,\n        website: 'https://' + domain,\n        country: (b.destinations && b.destinations[0]) || b.country || '' });\n      stats.companies++;\n    }\n    // report the contact if we have a real address\n    const email = clean(b.primaryEmail);\n    if (email.includes('@')) {\n      records.push({ op: 'contact', company: domain, email,\n        full_name: b.spocName || '', title: b.spocTitle || '',\n        linkedin_url: b.linkedinUrl || '' });\n      stats.contacts++;\n    }\n\n    if (b.needsAddress) { stats.needsAddress++; continue; } // don't cold-pitch\n    if (b.enrichStatus === 'role_inbox_ready' && email.includes('@')) {\n      toPersonalize.push(b);\n      stats.prospects++;\n    }\n  }\n\n  // ---- one ingest call for the whole batch (all-or-nothing) --------------\n  let ingest = { skipped: 'no crmToken' };\n  if (token && records.length) {\n    try {\n      const r = await fetch(base + '/ingest', {\n        method: 'POST',\n        headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },\n        body: JSON.stringify({ service: 'A', batch, records }),\n        signal: AbortSignal.timeout(60000),\n      });\n      const body = await r.json().catch(() => ({}));\n      ingest = { status: r.status, ...body };\n    } catch (e) {\n      ingest = { error: String(e && e.message) };\n    }\n  } else if (token) {\n    ingest = { skipped: 'nothing to report' };\n  }\n\n  return { toPersonalize, foundLog, ingest, records: records.length, stats };\n};\n",
+                              "packageJson": "{\n  \"dependencies\": {}\n}"
+                            },
+                            "inputUiInfo": {
+                              "customizedInputs": {}
+                            },
+                            "errorHandlingOptions": {
+                              "continueOnFailure": {
+                                "value": false
+                              },
+                              "retryOnFailure": {
+                                "value": false
+                              }
+                            }
+                          },
+                          "nextAction": {
+                            "name": "personalize",
+                            "type": "CODE",
+                            "valid": true,
+                            "displayName": "03 · Personalize (Ling)",
+                            "settings": {
+                              "input": {
+                                "enriched": "{{report['toPersonalize']}}",
+                                "llmApiKey": "",
+                                "senderName": "the sender",
+                                "catalogUrl": ""
+                              },
+                              "sourceCode": {
+                                "code": "/**\n * Activepieces Code piece — Stack 3 (BATCH): personalize many buyers in one step.\n *\n * Same logic as 03-personalize.js but takes the whole enriched array, splits it\n * into ready-to-send vs needs-review, and personalizes each ready buyer via Groq\n * with a small delay (respects free-tier rate limits). Avoids Activepieces Loop\n * result-aggregation entirely.\n *\n * INPUTS:\n *   enriched     = Stack-2b `enriched` array\n *   llmApiKey    = your OpenRouter API key (openrouter.ai/keys)   [required]\n *   model        = default 'inclusionai/ling-3.0-flash'\n *   llmBaseUrl   = default OpenRouter chat/completions endpoint\n *   jsonMode     = default false (Ling rejects response_format; the tolerant\n *                  parser below handles ```json-fenced output). Set true only\n *                  for a provider you've confirmed supports json_object.\n *   senderName   = default 'the sender'\n *   catalogUrl   = optional\n *   maxToWrite   = optional cap on LLM calls per run (default 25)\n *   delayMs      = optional gap between LLM calls (default 1200)\n *   appUrl       = optional, sent as OpenRouter HTTP-Referer (app ranking)\n *   appName      = optional, sent as OpenRouter X-Title (app ranking)\n *\n * OUTPUT { emails, review, stats }\n *   emails = [{ to, subject, body, buyerKey, buyerName, track }]  -> feed to 04a\n *   review = [ buyers with needs_review* ]                        -> Review tab\n */\n\nexport const code = async (inputs) => {\n  const rows = Array.isArray(inputs.enriched) ? inputs.enriched : [];\n  // Provider-agnostic LLM over an OpenAI-compatible endpoint. Defaults to\n  // inclusionAI Ling via OpenRouter. To swap providers, change llmBaseUrl +\n  // model + llmApiKey. (Older key names still accepted for back-compat.)\n  const apiKey = inputs.llmApiKey || inputs.openRouterApiKey ||\n    inputs.openrouterApiKey || inputs.geminiApiKey || inputs.groqApiKey;\n  const model = inputs.model || 'inclusionai/ling-3.0-flash';\n  const baseUrl = inputs.llmBaseUrl ||\n    'https://openrouter.ai/api/v1/chat/completions';\n  // Ling rejects response_format; default OFF and lean on parseJson(). Only\n  // enable for a provider you've confirmed supports json_object.\n  const jsonMode = inputs.jsonMode === true;\n  const senderName = inputs.senderName || 'the sender';\n  const catalogUrl = inputs.catalogUrl || '';\n  const maxToWrite = Number(inputs.maxToWrite) > 0 ? Number(inputs.maxToWrite) : 25;\n  const delayMs = Number(inputs.delayMs) >= 0 ? Number(inputs.delayMs) : 1200;\n\n  const Acme = {\n    company: 'Acme Exports',\n    product: 'compostable sugarcane bagasse tableware (HS 4823.70)',\n    range: '100+ SKUs — plates, bowls, clamshells, cups, containers, egg cartons',\n    capacity: '15 tons/day',\n    proof: 'certified, international quality standards; maintained product weight/thickness for high durability and oil & grease resistance (OGR)',\n    valueUS: 'lower overall landed cost so you can compete in the US market, faster turnarounds and quicker shipments, and a reliable India-based alternative as China tariffs raise import costs',\n    valueROW: 'competitive Ex-factory and FOB pricing from India, diversified sourcing, and a consistent supply chain to optimise landed cost and inventory',\n  };\n\n  const norm = (s) => String(s || '').toLowerCase();\n  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));\n\n  // tolerant JSON parse — some models wrap output in ```json ... ``` fences\n  const parseJson = (s) => {\n    let t = String(s || '').trim();\n    const m = t.match(/```(?:json)?\\s*([\\s\\S]*?)```/i);\n    if (m) t = m[1].trim();\n    return JSON.parse(t);\n  };\n\n  // Greeting target: a real person's first name if we have one, else the role\n  // behind the inbox we're mailing (purchasing@ -> \"Procurement Team\"). Never\n  // the company name.\n  const roleGreeting = (email) => {\n    const local = String(email || '').toLowerCase().split('@')[0];\n    if (/purchas|procure|sourc|buyer/.test(local)) return 'Procurement Team';\n    if (/import|order/.test(local)) return 'Purchasing Team';\n    return 'Team';\n  };\n\n  const writeOne = async (b) => {\n    const dest = norm((b.destinations && b.destinations[0]) || b.country || '');\n    const isUS = /united states|usa|u\\.s|america/.test(dest);\n    const track = isUS ? 'US' : 'ROW';\n    // only greet a person by name if we're actually emailing that person\n    const emailingPerson = b.spocEmail && b.primaryEmail &&\n      String(b.spocEmail).toLowerCase() === String(b.primaryEmail).toLowerCase();\n    const greetName = (emailingPerson && b.spocFirstName)\n      ? b.spocFirstName : roleGreeting(b.primaryEmail);\n    const sourceText = norm([].concat(b.origins || [], b.sellers || []).join(' '));\n    const chinaHook = /china|chinese|zhejiang|guangzhou|shenzhen|ningbo|shanghai|fujian|xiamen|zhongxin/.test(sourceText);\n    const importedProduct = (b.productLabels && b.productLabels[0]) ||\n      (b.products && b.products[0]) || 'bagasse / molded-fiber tableware';\n\n    const system =\n      `You are ${senderName}, founder of ${Acme.company}. You write short, ` +\n      `direct B2B cold outreach emails to importers of disposable foodservice ` +\n      `tableware. Plain, human, no fluff. 90-140 words. Never invent facts about ` +\n      `the recipient beyond what is given. The email MUST open with exactly ` +\n      `\"Hi ${greetName},\" and must NOT address the recipient by their company ` +\n      `name in the greeting. Return ONLY valid JSON: ` +\n      `{\"subject\":\"...\",\"body\":\"...\"}. No signature block. One clear CTA.`;\n    const track_brief = isUS\n      ? `Track: US importer. Lead with the China-tariff angle ONLY if chinaHook=${chinaHook}. Value: ${Acme.valueUS}.`\n      : `Track: non-US importer. Angle: diversify sourcing from India. Value: ${Acme.valueROW}.`;\n    const user =\n      `Write a personalized cold email.\\nRecipient company: ${b.buyerName}\\n` +\n      `They import: ${importedProduct}\\nCurrently sourcing from China: ${chinaHook}\\n` +\n      `${track_brief}\\nAbout us: ${Acme.company} supplies ${Acme.product}. ` +\n      `Range: ${Acme.range}. Capacity: ${Acme.capacity}. Proof: ${Acme.proof}.\\n` +\n      (catalogUrl ? `Mention a product catalogue is attached.\\n` : '') +\n      `CTA: ask for a quick call to discuss SKUs, samples and landed pricing (US) ` +\n      `or which SKUs interest them for an Ex-factory/FOB quote (non-US).`;\n\n    const payload = {\n      model, temperature: 0.6,\n      messages: [{ role: 'system', content: system }, { role: 'user', content: user }],\n    };\n    if (jsonMode) payload.response_format = { type: 'json_object' };\n    const headers = { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' };\n    // OpenRouter optional attribution headers — safe to omit for other providers.\n    if (inputs.appUrl) headers['HTTP-Referer'] = String(inputs.appUrl);\n    if (inputs.appName) headers['X-Title'] = String(inputs.appName);\n    const r = await fetch(baseUrl, {\n      method: 'POST',\n      headers,\n      body: JSON.stringify(payload),\n      signal: AbortSignal.timeout(20000),\n    });\n    if (!r.ok) {\n      const t = await r.text().catch(() => '');\n      throw new Error('HTTP ' + r.status + ': ' + t.slice(0, 300));\n    }\n    const j = await r.json();\n    const content = j.choices && j.choices[0] && j.choices[0].message &&\n      j.choices[0].message.content;\n    if (!content) throw new Error('no content in response: ' + JSON.stringify(j).slice(0, 300));\n    const p = parseJson(content);\n    const signature = `\\n\\n${senderName}\\nFounder, ${Acme.company}` +\n      (catalogUrl ? `\\nProduct catalogue: ${catalogUrl}` : '');\n    return {\n      to: b.primaryEmail || '',\n      subject: String(p.subject || '').trim(),\n      body: (String(p.body || '').trim() + signature),\n      buyerKey: b.buyerKey, buyerName: b.buyerName, track,\n      domain: b.domain || '',\n      spoc: b.spocName ? (b.spocName + (b.spocTitle ? ', ' + b.spocTitle : '')) : 'Role inbox',\n    };\n  };\n\n  // Anything plausibly a target but unresolved goes to the Review tab so nothing\n  // is silently lost when the 02b fallback step is skipped. (skipped_low_icp =\n  // intentional off-target drop, not reviewed.)\n  const REVIEW_STATUSES = new Set([\n    'needs_review', 'needs_review_cap', 'no_domain_free', 'domain_no_mx',\n  ]);\n  const ready = rows.filter((b) => b.enrichStatus === 'role_inbox_ready' && b.primaryEmail);\n  const review = rows.filter((b) => REVIEW_STATUSES.has(b.enrichStatus));\n\n  const emails = [];\n  const errors = [];\n  const stats = { readyIn: ready.length, written: 0, failed: 0, reviewOut: review.length };\n\n  for (const b of ready.slice(0, maxToWrite)) {\n    try {\n      const e = await writeOne(b);\n      if (e.subject && e.body) { emails.push(e); stats.written++; }\n      else { stats.failed++; if (errors.length < 3) errors.push('empty subject/body'); }\n    } catch (err) {\n      stats.failed++;\n      if (errors.length < 3) errors.push(String(err && err.message));\n    }\n    if (delayMs) await sleep(delayMs);\n  }\n  stats.errors = errors;\n\n  return { emails, review, stats };\n};\n",
+                                "packageJson": "{\n  \"dependencies\": {}\n}"
+                              },
+                              "inputUiInfo": {
+                                "customizedInputs": {}
+                              },
+                              "errorHandlingOptions": {
+                                "continueOnFailure": {
+                                  "value": false
+                                },
+                                "retryOnFailure": {
+                                  "value": false
+                                }
+                              }
+                            },
+                            "nextAction": {
+                              "name": "queue_gate",
+                              "type": "CODE",
+                              "valid": true,
+                              "displayName": "05 · Queue gate",
+                              "settings": {
+                                "input": {
+                                  "emails": "{{personalize['emails']}}",
+                                  "sentLog": "{{get_sent}}",
+                                  "outbox": "{{get_outbox}}"
+                                },
+                                "sourceCode": {
+                                  "code": "/**\n * Activepieces Code piece — Stack 5: Queue gate (dedup -> Outbox for approval).\n *\n * Takes the personalized emails and produces rows to APPEND to the Outbox tab\n * for human approval. Skips any buyer already handled — present in the Sent log\n * (already emailed) OR already in the Outbox (already queued/pending) — so a\n * re-dumped sheet with old rows never re-queues or re-sends anyone.\n *\n * Flow: personalize -> get_sent + get_outbox -> THIS -> Loop -> Insert Row (Outbox).\n *\n * INPUTS:\n *   emails   = personalize `emails` array\n *   sentLog  = rows from the Sent tab\n *   outbox   = rows from the Outbox tab\n *\n * OUTPUT { toQueue, stats }\n *   toQueue = rows to append to Outbox (approved left blank for you to fill)\n */\n\nexport const code = async (inputs) => {\n  const normSheet = (v) => {\n    let rows = Array.isArray(v) ? v\n      : (v && (Array.isArray(v.rows) ? v.rows\n        : Array.isArray(v.values) ? v.values\n        : Array.isArray(v.body) ? v.body : [])) || [];\n    if (!Array.isArray(rows)) rows = [];\n    rows = rows.map((r) => (r && typeof r.values === 'object' && r.values) ? { row: r.row, ...r.values } : r);\n    const lettered = rows.some((r) => r && (r.A !== undefined || r.B !== undefined));\n    if (!lettered) return rows;\n    const header = rows.find((r) => String(r.row) === '1') || rows[0];\n    if (!header) return [];\n    const map = {};\n    for (const [k, val] of Object.entries(header)) if (k !== 'row') map[k] = String(val).trim();\n    const out = [];\n    for (const r of rows) {\n      if (r === header || String(r.row) === '1') continue;\n      const obj = {};\n      if (r.row !== undefined) obj.row = r.row;\n      for (const [k, val] of Object.entries(r)) {\n        if (k === 'row') continue;\n        const name = map[k];\n        if (name) obj[name] = val;\n      }\n      out.push(obj);\n    }\n    return out;\n  };\n\n  const emails = Array.isArray(inputs.emails) ? inputs.emails : [];\n  const sentLog = normSheet(inputs.sentLog);\n  const outbox = normSheet(inputs.outbox);\n\n  const lc = (s) => String(s || '').toLowerCase().trim();\n\n  // anyone already emailed OR already queued is \"handled\"\n  const handledKeys = new Set();\n  const handledEmails = new Set();\n  for (const r of [...sentLog, ...outbox]) {\n    if (r.buyerKey) handledKeys.add(lc(r.buyerKey));\n    if (r.to) handledEmails.add(lc(r.to));\n  }\n\n  const toQueue = [];\n  const seen = new Set();\n  const skipped = { alreadyHandled: 0, noAddress: 0, dupInBatch: 0 };\n  const nowIso = new Date().toISOString();\n\n  for (const e of emails) {\n    const to = lc(e.to);\n    if (!to || !to.includes('@')) { skipped.noAddress++; continue; }\n    if (handledKeys.has(lc(e.buyerKey)) || handledEmails.has(to)) { skipped.alreadyHandled++; continue; }\n    if (seen.has(to)) { skipped.dupInBatch++; continue; }\n    seen.add(to);\n\n    toQueue.push({\n      buyerKey: e.buyerKey || '',\n      buyerName: e.buyerName || '',\n      domain: e.domain || '',\n      spoc: e.spoc || '',\n      to: e.to,\n      subject: e.subject || '',\n      body: e.body || '',\n      track: e.track || '',\n      approved: '',            // <-- you set this to \"yes\" to release the email\n      status: 'pending',\n      queuedAt: nowIso,\n    });\n  }\n\n  return {\n    toQueue,\n    stats: { emailsIn: emails.length, queued: toQueue.length, ...skipped },\n  };\n};\n",
+                                  "packageJson": "{\n  \"dependencies\": {}\n}"
+                                },
+                                "inputUiInfo": {
+                                  "customizedInputs": {}
+                                },
+                                "errorHandlingOptions": {
+                                  "continueOnFailure": {
+                                    "value": false
+                                  },
+                                  "retryOnFailure": {
+                                    "value": false
+                                  }
+                                }
+                              },
+                              "nextAction": {
+                                "name": "approved_gate",
+                                "type": "CODE",
+                                "valid": true,
+                                "displayName": "06 · Approved-send gate",
+                                "settings": {
+                                  "input": {
+                                    "outbox": "{{get_outbox}}",
+                                    "sentLog": "{{get_sent}}",
+                                    "maxPerRun": 5,
+                                    "dailyCap": 40,
+                                    "testMode": true,
+                                    "testRecipient": ""
+                                  },
+                                  "sourceCode": {
+                                    "code": "/**\n * Activepieces Code piece — Stack 6: Approved-send gate.\n *\n * Reads the Outbox tab and releases ONLY rows you approved and that haven't been\n * sent yet. Applies the same throttle + test-mode redirect as the old send gate.\n * Produces: the batch to send, the Sent-log rows to append, and the Outbox rows\n * to mark as sent.\n *\n * Flow: get_outbox -> THIS -> Loop(toSend)->Gmail -> Loop(newLogRows)->Insert Sent\n *       -> Loop(outboxUpdates)->Update Row (Outbox).\n *\n * INPUTS:\n *   outbox        = rows from the Outbox tab (must include each row's line number)\n *   sentLog       = rows from the Sent tab (for the daily counter + safety dedup)\n *   maxPerRun     = default 5\n *   dailyCap      = default 40\n *   testMode      = boolean\n *   testRecipient = your inbox (required if testMode)\n *\n * OUTPUT { toSend, newLogRows, outboxUpdates, skipped }\n */\n\nexport const code = async (inputs) => {\n  const normSheet = (v) => {\n    let rows = Array.isArray(v) ? v\n      : (v && (Array.isArray(v.rows) ? v.rows\n        : Array.isArray(v.values) ? v.values\n        : Array.isArray(v.body) ? v.body : [])) || [];\n    if (!Array.isArray(rows)) rows = [];\n    rows = rows.map((r) => (r && typeof r.values === 'object' && r.values) ? { row: r.row, ...r.values } : r);\n    const lettered = rows.some((r) => r && (r.A !== undefined || r.B !== undefined));\n    if (!lettered) return rows;\n    const header = rows.find((r) => String(r.row) === '1') || rows[0];\n    if (!header) return [];\n    const map = {};\n    for (const [k, val] of Object.entries(header)) if (k !== 'row') map[k] = String(val).trim();\n    const out = [];\n    for (const r of rows) {\n      if (r === header || String(r.row) === '1') continue;\n      const obj = {};\n      if (r.row !== undefined) obj.row = r.row;\n      for (const [k, val] of Object.entries(r)) {\n        if (k === 'row') continue;\n        const name = map[k];\n        if (name) obj[name] = val;\n      }\n      out.push(obj);\n    }\n    return out;\n  };\n\n  const outbox = normSheet(inputs.outbox);\n  const sentLog = normSheet(inputs.sentLog);\n  const maxPerRun = Number(inputs.maxPerRun) > 0 ? Number(inputs.maxPerRun) : 5;\n  const dailyCap = Number(inputs.dailyCap) > 0 ? Number(inputs.dailyCap) : 40;\n  const testMode = Boolean(inputs.testMode);\n  const testRecipient = String(inputs.testRecipient || '').trim();\n\n  const lc = (s) => String(s || '').toLowerCase().trim();\n  const today = new Date().toISOString().slice(0, 10);\n  const isApproved = (v) => /^(y|yes|true|1|approve|approved|✓|x)$/i.test(String(v || '').trim());\n  const isSent = (v) => /^(sent|done)$/i.test(String(v || '').trim());\n\n  if (testMode && !testRecipient) {\n    return { toSend: [], newLogRows: [], outboxUpdates: [],\n      skipped: { error: 'testMode on but no testRecipient' } };\n  }\n\n  // already-sent guard + today's counter (from Sent log)\n  const sentKeys = new Set();\n  let sentToday = 0;\n  for (const r of sentLog) {\n    if (r.buyerKey) sentKeys.add(lc(r.buyerKey));\n    if (String(r.sentAt || '').slice(0, 10) === today) sentToday++;\n  }\n\n  const skipped = { notApproved: 0, alreadySent: 0, noRow: 0 };\n  const eligible = [];\n  for (const r of outbox) {\n    if (!isApproved(r.approved)) { skipped.notApproved++; continue; }\n    if (isSent(r.status) || sentKeys.has(lc(r.buyerKey))) { skipped.alreadySent++; continue; }\n    if (r.row === undefined || r.row === null || r.row === '') { skipped.noRow++; continue; }\n    eligible.push(r);\n  }\n\n  const remainingDaily = Math.max(0, dailyCap - sentToday);\n  const takeN = Math.min(maxPerRun, remainingDaily, eligible.length);\n  const batch = eligible.slice(0, takeN);\n\n  const nowIso = new Date().toISOString();\n  const toSend = [];\n  const newLogRows = [];\n  const outboxUpdates = [];\n\n  for (const r of batch) {\n    const realTo = r.to;\n    toSend.push({\n      to: testMode ? testRecipient : realTo,\n      subject: testMode ? `[TEST → ${realTo}] ${r.subject}` : r.subject,\n      body: r.body,\n    });\n    newLogRows.push({\n      buyerKey: r.buyerKey || '', buyerName: r.buyerName || '', to: realTo,\n      subject: r.subject || '', track: r.track || '', status: 'sent',\n      sentAt: nowIso, lastActionAt: nowIso, followupCount: 0,\n      testMode: testMode ? 'yes' : 'no',\n    });\n    outboxUpdates.push({ row: r.row, status: 'sent', sentAt: nowIso });\n  }\n\n  return {\n    toSend, newLogRows, outboxUpdates,\n    skipped: { ...skipped, sentTodayBefore: sentToday,\n      eligible: eligible.length, sending: batch.length,\n      heldByThrottle: Math.max(0, eligible.length - batch.length) },\n  };\n};\n",
+                                    "packageJson": "{\n  \"dependencies\": {}\n}"
+                                  },
+                                  "inputUiInfo": {
+                                    "customizedInputs": {}
+                                  },
+                                  "errorHandlingOptions": {
+                                    "continueOnFailure": {
+                                      "value": false
+                                    },
+                                    "retryOnFailure": {
+                                      "value": false
+                                    }
+                                  }
+                                },
+                                "nextAction": {
+                                  "name": "loop_send",
+                                  "type": "LOOP_ON_ITEMS",
+                                  "valid": true,
+                                  "displayName": "Loop: send approved",
+                                  "settings": {
+                                    "items": "{{approved_gate['toSend']}}",
+                                    "inputUiInfo": {}
+                                  },
+                                  "firstLoopAction": {
+                                    "name": "send_gmail",
+                                    "type": "PIECE",
+                                    "valid": false,
+                                    "displayName": "Send Email (from sender@)",
+                                    "settings": {
+                                      "pieceName": "@activepieces/piece-gmail",
+                                      "pieceVersion": "~0.8.0",
+                                      "pieceType": "OFFICIAL",
+                                      "packageType": "REGISTRY",
+                                      "actionName": "send_email",
+                                      "input": {
+                                        "receiver": [
+                                          "{{loop_send['item']['to']}}"
+                                        ],
+                                        "subject": "{{loop_send['item']['subject']}}",
+                                        "body_text": "{{loop_send['item']['body']}}"
+                                      },
+                                      "inputUiInfo": {},
+                                      "errorHandlingOptions": {
+                                        "continueOnFailure": {
+                                          "value": false
+                                        },
+                                        "retryOnFailure": {
+                                          "value": false
+                                        }
+                                      }
+                                    }
+                                  },
+                                  "nextAction": {
+                                    "name": "loop_log",
+                                    "type": "LOOP_ON_ITEMS",
+                                    "valid": true,
+                                    "displayName": "Loop: log to Sent",
+                                    "settings": {
+                                      "items": "{{approved_gate['newLogRows']}}",
+                                      "inputUiInfo": {}
+                                    },
+                                    "firstLoopAction": {
+                                      "name": "insert_sent",
+                                      "type": "PIECE",
+                                      "valid": false,
+                                      "displayName": "Log to Sent",
+                                      "settings": {
+                                        "pieceName": "@activepieces/piece-google-sheets",
+                                        "pieceVersion": "~0.9.0",
+                                        "pieceType": "OFFICIAL",
+                                        "packageType": "REGISTRY",
+                                        "actionName": "insert_row",
+                                        "input": {
+                                          "values": {
+                                            "buyerKey": "{{loop_log['item']['buyerKey']}}",
+                                            "buyerName": "{{loop_log['item']['buyerName']}}",
+                                            "to": "{{loop_log['item']['to']}}",
+                                            "subject": "{{loop_log['item']['subject']}}",
+                                            "track": "{{loop_log['item']['track']}}",
+                                            "status": "{{loop_log['item']['status']}}",
+                                            "sentAt": "{{loop_log['item']['sentAt']}}",
+                                            "lastActionAt": "{{loop_log['item']['lastActionAt']}}",
+                                            "followupCount": "{{loop_log['item']['followupCount']}}",
+                                            "testMode": "{{loop_log['item']['testMode']}}"
+                                          }
+                                        },
+                                        "inputUiInfo": {},
+                                        "errorHandlingOptions": {
+                                          "continueOnFailure": {
+                                            "value": false
+                                          },
+                                          "retryOnFailure": {
+                                            "value": false
+                                          }
+                                        }
+                                      }
+                                    },
+                                    "nextAction": {
+                                      "name": "loop_outbox_update",
+                                      "type": "LOOP_ON_ITEMS",
+                                      "valid": true,
+                                      "displayName": "Loop: mark Outbox sent",
+                                      "settings": {
+                                        "items": "{{approved_gate['outboxUpdates']}}",
+                                        "inputUiInfo": {}
+                                      },
+                                      "firstLoopAction": {
+                                        "name": "update_outbox",
+                                        "type": "PIECE",
+                                        "valid": false,
+                                        "displayName": "Mark Outbox sent",
+                                        "settings": {
+                                          "pieceName": "@activepieces/piece-google-sheets",
+                                          "pieceVersion": "~0.9.0",
+                                          "pieceType": "OFFICIAL",
+                                          "packageType": "REGISTRY",
+                                          "actionName": "update_row",
+                                          "input": {
+                                            "row_id": "{{loop_outbox_update['item']['row']}}",
+                                            "values": {
+                                              "status": "{{loop_outbox_update['item']['status']}}",
+                                              "sentAt": "{{loop_outbox_update['item']['sentAt']}}"
+                                            }
+                                          },
+                                          "inputUiInfo": {},
+                                          "errorHandlingOptions": {
+                                            "continueOnFailure": {
+                                              "value": false
+                                            },
+                                            "retryOnFailure": {
+                                              "value": false
+                                            }
+                                          }
+                                        }
+                                      },
+                                      "nextAction": {
+                                        "name": "loop_queue",
+                                        "type": "LOOP_ON_ITEMS",
+                                        "valid": true,
+                                        "displayName": "A · Loop: queue rows",
+                                        "settings": {
+                                          "items": "{{queue_gate['toQueue']}}",
+                                          "inputUiInfo": {}
+                                        },
+                                        "firstLoopAction": {
+                                          "name": "insert_outbox",
+                                          "type": "PIECE",
+                                          "valid": false,
+                                          "displayName": "A · Queue to Outbox",
+                                          "settings": {
+                                            "pieceName": "@activepieces/piece-google-sheets",
+                                            "pieceVersion": "~0.9.0",
+                                            "pieceType": "OFFICIAL",
+                                            "packageType": "REGISTRY",
+                                            "actionName": "insert_row",
+                                            "input": {
+                                              "values": {
+                                                "buyerKey": "{{loop_queue['item']['buyerKey']}}",
+                                                "buyerName": "{{loop_queue['item']['buyerName']}}",
+                                                "domain": "{{loop_queue['item']['domain']}}",
+                                                "spoc": "{{loop_queue['item']['spoc']}}",
+                                                "to": "{{loop_queue['item']['to']}}",
+                                                "subject": "{{loop_queue['item']['subject']}}",
+                                                "body": "{{loop_queue['item']['body']}}",
+                                                "track": "{{loop_queue['item']['track']}}",
+                                                "approved": "{{loop_queue['item']['approved']}}",
+                                                "status": "{{loop_queue['item']['status']}}",
+                                                "queuedAt": "{{loop_queue['item']['queuedAt']}}"
+                                              }
+                                            },
+                                            "inputUiInfo": {},
+                                            "errorHandlingOptions": {
+                                              "continueOnFailure": {
+                                                "value": false
+                                              },
+                                              "retryOnFailure": {
+                                                "value": false
+                                              }
+                                            }
+                                          }
+                                        },
+                                        "nextAction": {
+                                          "name": "loop_found",
+                                          "type": "LOOP_ON_ITEMS",
+                                          "valid": true,
+                                          "displayName": "Log · Loop: found rows",
+                                          "settings": {
+                                            "items": "{{report['foundLog']}}",
+                                            "inputUiInfo": {}
+                                          },
+                                          "firstLoopAction": {
+                                            "name": "insert_found",
+                                            "type": "PIECE",
+                                            "valid": false,
+                                            "displayName": "Log · Found (domain/spoc/mail)",
+                                            "settings": {
+                                              "pieceName": "@activepieces/piece-google-sheets",
+                                              "pieceVersion": "~0.9.0",
+                                              "pieceType": "OFFICIAL",
+                                              "packageType": "REGISTRY",
+                                              "actionName": "insert_row",
+                                              "input": {
+                                                "values": {
+                                                  "buyerKey": "{{loop_found['item']['buyerKey']}}",
+                                                  "buyerName": "{{loop_found['item']['buyerName']}}",
+                                                  "domain": "{{loop_found['item']['domain']}}",
+                                                  "domainConfidence": "{{loop_found['item']['domainConfidence']}}",
+                                                  "spocName": "{{loop_found['item']['spocName']}}",
+                                                  "spocEmail": "{{loop_found['item']['spocEmail']}}",
+                                                  "mailFound": "{{loop_found['item']['mailFound']}}",
+                                                  "enrichStatus": "{{loop_found['item']['enrichStatus']}}",
+                                                  "foundAt": "{{loop_found['item']['foundAt']}}"
+                                                }
+                                              },
+                                              "inputUiInfo": {},
+                                              "errorHandlingOptions": {
+                                                "continueOnFailure": {
+                                                  "value": false
+                                                },
+                                                "retryOnFailure": {
+                                                  "value": false
+                                                }
+                                              }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "valid": false,
+    "connectionIds": [],
+    "schemaVersion": "1"
+  },
+  "blogUrl": ""
+}
